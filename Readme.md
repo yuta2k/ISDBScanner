@@ -31,7 +31,8 @@ BS・CS では、**BS・CS1・CS2 ごとに1つの物理チャンネルのみを
 > 地上波の物理チャンネルのうち 53ch - 62ch はすでに廃止されていますが、依然として一部ケーブルテレビのコミュニティチャンネル (自主放送) にて利用されているため、スキャン対象に含めています。
 
 > [!IMPORTANT]  
-> 検証環境がないため、ISDB-T の C13 - C63ch (周波数変換パススルー方式) と、ISDB-C (トランスモジュレーション方式) で放送されているチャンネルのスキャンには対応していません。 
+> 本家 ISDBScanner は、検証環境がないため ISDB-T の C13 - C63ch (周波数変換パススルー方式) と、ISDB-C (トランスモジュレーション方式) で放送されているチャンネルのスキャンには対応していません。  
+> **このフォーク ([yuta2k/ISDBScanner](https://github.com/yuta2k/ISDBScanner)) では、ケーブルテレビ (CATV) のトランスモジュレーション方式のスキャンに対応しています。詳しくは [CATV (トランスモジュレーション) 対応](#catv-トランスモジュレーション-対応) を参照してください。**
 
 - [ISDBScanner](#isdbscanner)
   - [対応チューナー](#対応チューナー)
@@ -42,6 +43,12 @@ BS・CS では、**BS・CS1・CS2 ごとに1つの物理チャンネルのみを
   - [使い方](#使い方)
     - [PC に接続されている利用可能なチューナーのリストを表示](#pc-に接続されている利用可能なチューナーのリストを表示)
     - [チャンネルスキャンを実行](#チャンネルスキャンを実行)
+  - [CATV (トランスモジュレーション) 対応](#catv-トランスモジュレーション-対応)
+    - [CATV 対応チューナーと dvbv5-zap のインストール](#catv-対応チューナーと-dvbv5-zap-のインストール)
+    - [CATV チャンネルスキャンを実行](#catv-チャンネルスキャンを実行)
+    - [出力されるファイル](#出力されるファイル)
+    - [TSMF 分離フィルタ](#tsmf-分離フィルタ)
+    - [8K マルチキャリアの並列収録](#8k-マルチキャリアの並列収録)
   - [注意事項](#注意事項)
   - [License](#license)
 
@@ -273,6 +280,141 @@ PC に接続したはずのチューナーが認識されていない場合は�
 > [!NOTE]  
 > 出力される Mirakurun / mirakc のチューナー設定ファイルには、現在 PC に接続中のチューナーのみが記載されます。  
 > 接続しているはずのチューナーが記載されない (ISDBScanner で認識されていない) 場合は、カーネルドライバのロード状態や、物理的なチューナーの接続状態を確認してみてください。
+
+## CATV (トランスモジュレーション) 対応
+
+> [!NOTE]  
+> **このセクションで説明する機能は、フォーク ([yuta2k/ISDBScanner](https://github.com/yuta2k/ISDBScanner)) で追加した独自機能です。本家 ISDBScanner には含まれていません。**
+
+日本のケーブルテレビ (CATV) で使われる **トランスモジュレーション方式 (ISDB-C / ITU-T J.83 Annex C・64QAM)** のチャンネルスキャンに対応しています。  
+地上波・BS・CS の通常スキャン (`isdb-scanner`) とは独立した別コマンド群として実装しているため、**既存のスキャン機能やその出力には一切影響しません。**
+
+主な機能:
+
+- **TSMF (JCTEA STD-002) 多重の分離**
+  - CATV では、1つの物理チャンネル (RF) に複数の TS を多重して伝送する「トランスモジュレーション」が使われることがあります。この多重フレーム (TSMF) を解析し、多重されている相対 TS (1〜15) ごとに分離してスキャンします。
+- **CAS 種別の判定**
+  - 各チャンネルのスクランブル状態 (PMT/CAT の CA 記述子・スクランブル率・SDT の有料放送フラグ) を解析し、視聴に必要なカード種別 (**カード不要 / B-CAS / C-CAS / A-CAS**) を判定して出力します。
+- **再送信元の判定**
+  - 各 TS が地上波・BS・CS の再送信か、CATV 局の自主放送 (コミュニティチャンネル) かを、ネットワーク ID から判定します。
+- **4K/8K (MMT/TLV) 放送の解析**
+  - 高度 BS デジタル放送 (4K/8K) を再送信している MMT/TLV チャンネルから、サービス・アセット構成やネットワーク情報 (TLV-NIT) を JSON に出力します。**シグナリング情報は非スクランブルのため、ACAS カードなしで解析できます。**
+- **8K マルチキャリア分散伝送の検出**
+  - 8K 放送が複数の物理チャンネルに分割して伝送されている場合、TSMF ヘッダの拡張情報や TLV-NIT の周波数リストから、そのグループ構成 (どの物理チャンネルが同じ 8K 放送の一部か) を検出します。
+
+> [!IMPORTANT]  
+> **CATV 対応では、チューナー受信コマンドとして recisdb ではなく [dvbv5-zap](https://www.linuxtv.org/wiki/index.php/Dvbv5-zap) (DVBv5 Tools / dvb-tools) を使用します。**  
+> recisdb は ISDB-C (トランスモジュレーション) に対応していないためです。  
+> そのため、**ITU-T J.83 Annex C 対応の DVB 版チューナーが必要です。** 動作検証は [Digital Devices Max M4](https://www.digital-devices.eu/) で行っています。
+
+> [!NOTE]  
+> **ISDBScanner (本フォーク含む) は、スクランブルされた放送のデコードは行いません。**  
+> CATV スキャンは、放送波に含まれる非スクランブルのメタデータ (PAT / NIT / SDT / MMT シグナリングなど) のみを解析します。  
+> B-CAS / C-CAS / A-CAS カードによるスクランブル解除は、Mirakurun / mirakc / EDCB など実際に受信・録画を行うソフト側で行ってください。
+
+### CATV 対応チューナーと dvbv5-zap のインストール
+
+CATV スキャンには、DVB-C (ITU-T J.83 Annex C) 対応の DVB 版チューナーと、`dvbv5-zap` コマンドが必要です。  
+`dvbv5-zap` は、Debian / Ubuntu では以下のようにインストールできます。
+
+```bash
+sudo apt install dvb-tools
+```
+
+CATV 対応の各コマンド (`isdb-catv-scanner` / `isdb-tsmf-split` / `isdb-catv-capture`) は、`catv` ブランチのソースコードから利用します。
+
+```bash
+# ソースコードからの実行 (Python 3.11 以降 + Poetry が必要)
+git clone -b catv https://github.com/yuta2k/ISDBScanner.git
+cd ISDBScanner
+poetry install
+poetry run isdb-catv-scanner --list-tuners
+```
+
+> [!NOTE]  
+> GitHub Actions のビルドワークフローでは、通常の `isdb-scanner` に加え、`isdb-catv-scanner` / `isdb-tsmf-split` / `isdb-catv-capture` のシングルバイナリもビルドされます。
+
+### CATV チャンネルスキャンを実行
+
+利用可能な CATV 対応チューナーを確認するには、`isdb-catv-scanner --list-tuners` を実行します。
+
+CATV チャンネルスキャンを実行するには、`isdb-catv-scanner` を実行します。  
+出力先ディレクトリを指定しない場合は `./scanned/` に出力されます。
+
+```bash
+# すべての CATV 物理チャンネル (CATV_13〜62 / CATV_C13〜C63) をスキャン
+poetry run isdb-catv-scanner ./scanned/
+
+# 特定の物理チャンネルのみをスキャン
+poetry run isdb-catv-scanner --channels CATV_15,CATV_C36 ./scanned/
+```
+
+主なオプション:
+
+- **`--channels <物理チャンネル,...>`**: スキャン対象の物理チャンネルをカンマ区切りで指定します (例: `CATV_15,CATV_C36`)。省略時はすべての CATV 物理チャンネルをスキャンします。
+- **`--adapter <番号>`**: 使用する DVB アダプタ番号を指定します。省略時は検出された CATV 対応チューナーの先頭を使用します。
+- **`--recording-time <秒>`**: 各物理チャンネルの受信時間 (秒) を指定します (デフォルト: 10 秒)。
+- **`--collect-signal-stats` / `--no-collect-signal-stats`**: 選局中に信号強度・CNR・ビットエラーレートを取得して結果に含めます (デフォルト: 有効)。
+- **`--no-diff`**: 出力先に既存の `CATV.json` があっても、前回スキャンとの差分レポートを生成しません。
+
+> [!NOTE]  
+> 物理チャンネル名は、[日本の CATV で一般的な周波数プラン](https://github.com/yuta2k/ISDBScanner/blob/catv/isdb_scanner/catv/constants.py) に基づき、UHF 帯 (`CATV_13`〜`CATV_62`) と下位バンド (`CATV_C13`〜`CATV_C63`) を定義しています。  
+> DELIVERY_SYSTEM は `DVBC/ANNEX_A`、SYMBOL_RATE は 5,274,000、MODULATION は `QAM/AUTO` を使用します。
+
+### 出力されるファイル
+
+CATV スキャンは、指定されたディレクトリ以下に以下のファイルを出力します。
+
+- **CATV.json**
+  - 各物理チャンネル (キャリア) の解析結果を、物理チャンネル名をキーとした JSON 形式で出力します。
+  - キャリア種別 (TSMF / SingleTS / TLV / Empty)、多重されている各 TS の TSID・ネットワーク情報・サービス一覧・CAS 種別・再送信元・信号品質、および MMT/TLV チャンネルのサービス/アセット構成・8K マルチキャリアグループ情報が含まれます。
+- **CATV.diff.txt**
+  - 出力先に前回の `CATV.json` が存在する場合のみ生成されます。
+  - 前回スキャンからのチャンネル・TS・サービス・CAS 種別・再送信元の増減/変化を、`+` / `-` / `~` のプレフィックス付きのプレーンテキストで出力します。CATV はヘッドエンドの構成変更が起きやすいため、定期スキャンでの差分確認に利用できます。
+- **dvbv5_channels_catv.conf**
+  - 受信できた (ロックに成功した) チャンネルのみを収録した、dvbv5 形式のチャンネル設定ファイルです。`dvbv5-zap -c dvbv5_channels_catv.conf ...` でそのまま選局に利用できます。
+- **Mirakurun/channels_catv.yml**
+  - Mirakurun 用のチャンネル設定 (CATV 部分) です。
+  - **Mirakurun は TSMF 分離をネイティブサポートしている ([`tsmfRelTs`](https://github.com/Chinachu/Mirakurun/blob/master/doc/Configuration.md) プロパティ)** ため、TSMF 多重チャンネルには `tsmfRelTs` キーを付与して出力します。ファイル冒頭のコメントに、`dvbv5-zap` を使う `tuners.yml` の記述例を記載しています。
+- **mirakc/channels_catv.yml**
+  - mirakc 用のチャンネル設定 (CATV 部分) です。
+  - **mirakc は TSMF 分離に対応していない**ため、チューナーコマンドのパイプに `isdb-tsmf-split --rel-ts <番号>` を挟む形の設定例を出力します。
+
+### TSMF 分離フィルタ
+
+`isdb-tsmf-split` は、TSMF 多重された TS ストリームから、指定した相対 TS を取り出す標準入出力フィルタです。  
+**TSMF 分離に対応していないレコーダー (mirakc / EDCB など) でも、チューナーコマンドの後段にパイプで挟むことで CATV の多重チャンネルを選局できます。**
+
+```bash
+# 相対 TS 番号 1 を取り出す
+dvbv5-zap -c dvbv5_channels_catv.conf -P -o - -t 30 CATV_15 | isdb-tsmf-split --rel-ts 1 > output.ts
+
+# 多重されている相対 TS の一覧とキャリア種別を JSON で確認
+cat multiplexed.ts | isdb-tsmf-split --list
+```
+
+### 8K マルチキャリアの並列収録
+
+`isdb-catv-capture` は、複数のチューナーを使って複数の物理チャンネルを **同時に** 収録するコマンドです。  
+8K 放送が複数の物理チャンネルに分割して伝送されている場合、それらを同時に収録することで、後から結合 (再多重) して 8K を復元できる可能性のあるデータを取得できます。
+
+```bash
+# 8K を構成する 3 キャリア (物理チャンネルはスキャン結果の 8K マルチキャリアグループ情報で確認) を
+# 3 つのチューナーで同時に 30 秒間収録
+poetry run isdb-catv-capture --channels CATV_C32,CATV_C33,CATV_C34 --time 30 --output-dir ./captured/
+```
+
+主なオプション:
+
+- **`--channels <物理チャンネル,...>`** (必須): 同時に収録する物理チャンネルをカンマ区切りで指定します。
+- **`--time <秒>`**: 各チャンネルの収録時間 (秒) を指定します (デフォルト: 30 秒)。
+- **`--output-dir <ディレクトリ>`**: 収録した TS ファイルの出力先を指定します (デフォルト: `./captured/`)。
+- **`--adapters <番号,...>`**: 使用する DVB アダプタ番号をチャンネルごとにカンマ区切りで指定します。省略時は検出されたチューナーから自動割り当てします。
+
+各チューナーの選局開始タイミングを揃えて同時収録し、収録後に各ファイルの MMTP シーケンス番号の範囲が重複しているか (＝分散伝送を再結合できるデータか) を判定して表示します。
+
+> [!IMPORTANT]  
+> 同時収録するチャンネル数だけ、DVB-C 対応チューナーが必要です。チャンネル数がチューナー数を超える場合はエラーになります。
 
 ## 注意事項
 
