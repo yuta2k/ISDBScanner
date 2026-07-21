@@ -95,6 +95,38 @@ jobs:
           name: isdb-scanner${{ matrix.artifact_suffix }}
           path: dist/isdb-scanner${{ matrix.artifact_suffix }}
 
+      # CATV (トランスモジュレーション) 対応バイナリを PyInstaller でビルド
+      # isdb-scanner 本体とは別バイナリに分離している (CATV 機能をサブコマンドとして isdb-scanner に統合すると、
+      # 素の isdb-scanner 実行を壊すリスクがあるため。詳細は isdb_scanner/catv/ のコメント参照)
+      - name: Build CATV Binaries with PyInstaller
+        run: |
+          docker run --rm -i -v $(pwd):/work -w /work ubuntu:20.04-custom bash -c \
+            'poetry install && \
+             poetry run pyinstaller --onefile --collect-submodules shellingham --name=isdb-catv-scanner${{ matrix.artifact_suffix }} isdb_scanner/catv/scan.py && \
+             poetry run pyinstaller --onefile --name=isdb-tsmf-split${{ matrix.artifact_suffix }} isdb_scanner/catv/tsmf_split_cli.py && \
+             poetry run pyinstaller --onefile --collect-submodules shellingham --name=isdb-catv-capture${{ matrix.artifact_suffix }} isdb_scanner/catv/capture.py'
+
+      # isdb-catv-scanner バイナリを Artifact としてアップロード
+      - name: Upload isdb-catv-scanner Executable as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: isdb-catv-scanner${{ matrix.artifact_suffix }}
+          path: dist/isdb-catv-scanner${{ matrix.artifact_suffix }}
+
+      # isdb-tsmf-split バイナリを Artifact としてアップロード
+      - name: Upload isdb-tsmf-split Executable as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: isdb-tsmf-split${{ matrix.artifact_suffix }}
+          path: dist/isdb-tsmf-split${{ matrix.artifact_suffix }}
+
+      # isdb-catv-capture バイナリを Artifact としてアップロード
+      - name: Upload isdb-catv-capture Executable as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: isdb-catv-capture${{ matrix.artifact_suffix }}
+          path: dist/isdb-catv-capture${{ matrix.artifact_suffix }}
+
       # Wheel をビルド
       # ISDBScanner 自体は Pure Python パッケージなので、重複回避のため x64 版のみ実行
       - name: Build Wheel
@@ -143,6 +175,42 @@ jobs:
           name: isdb-scanner-wheel
           path: dist
 
+      # isdb-catv-scanner Artifact をダウンロード (x86_64 / arm64)
+      - name: Download Artifact (isdb-catv-scanner, x86_64)
+        uses: actions/download-artifact@v4
+        with:
+          name: isdb-catv-scanner
+          path: dist
+      - name: Download Artifact (isdb-catv-scanner, arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: isdb-catv-scanner-arm
+          path: dist
+
+      # isdb-tsmf-split Artifact をダウンロード (x86_64 / arm64)
+      - name: Download Artifact (isdb-tsmf-split, x86_64)
+        uses: actions/download-artifact@v4
+        with:
+          name: isdb-tsmf-split
+          path: dist
+      - name: Download Artifact (isdb-tsmf-split, arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: isdb-tsmf-split-arm
+          path: dist
+
+      # isdb-catv-capture Artifact をダウンロード (x86_64 / arm64)
+      - name: Download Artifact (isdb-catv-capture, x86_64)
+        uses: actions/download-artifact@v4
+        with:
+          name: isdb-catv-capture
+          path: dist
+      - name: Download Artifact (isdb-catv-capture, arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: isdb-catv-capture-arm
+          path: dist
+
       # リリースを作成
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -152,3 +220,9 @@ jobs:
             ./dist/isdb-scanner
             ./dist/isdb-scanner-arm
             ./dist/isdb_scanner-*.whl
+            ./dist/isdb-catv-scanner
+            ./dist/isdb-catv-scanner-arm
+            ./dist/isdb-tsmf-split
+            ./dist/isdb-tsmf-split-arm
+            ./dist/isdb-catv-capture
+            ./dist/isdb-catv-capture-arm

@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Poetry のバージョン (build.yml と揃える)
+  POETRY_VERSION: '1.8.5'
+
+jobs:
+
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+
+      # ISDBScanner のソースコードをチェックアウト
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Python をセットアップ
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Poetry をインストール
+      - name: Install Poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+
+      # 依存関係をインストール (dev group の pytest / ruff を含む)
+      - name: Install Dependencies
+        run: poetry install
+
+      # Ruff で静的解析
+      - name: Run Ruff
+        run: poetry run ruff check isdb_scanner/ tests/
+
+      # pytest を実行 (テストはすべて合成データによるもので、外部ファイルには依存しない)
+      - name: Run Pytest
+        run: poetry run pytest tests/ -q
