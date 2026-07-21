@@ -23,8 +23,18 @@ typing-extensions = ">=4.7.1"
 
 [tool.poetry.group.dev.dependencies]
 pyinstaller = ">=5.13.2"
+pytest = ">=8.0.0"
 ruff = ">=0.9.1"
 taskipy = ">=1.14.0"
+
+[tool.poetry.scripts]
+isdb-tsmf-split = "isdb_scanner.catv.tsmf_split_cli:main"
+isdb-catv-scanner = "isdb_scanner.catv.scan:app"
+isdb-catv-capture = "isdb_scanner.catv.capture:app"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["poetry-core"]
