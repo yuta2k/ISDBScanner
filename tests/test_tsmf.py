@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 
 from isdb_scanner.catv.constants import CarrierType
@@ -110,3 +112,43 @@ class TestTSMFDemultiplexerSynthetic:
         assert TSMFDemultiplexer.detect_carrier_type(tsmf_stream) == CarrierType.TSMF
         assert TSMFDemultiplexer.detect_carrier_type(b'') == CarrierType.Empty
 
+
+def BuildSyntheticTSMFStream(frame_count: int = 3) -> bytes:
+    """テスト用に、相対 TS 1/2 が多重された TSMF ストリームを複数フレーム分生成する"""
+    table = [1] * 26 + [2] * 26
+    stream = bytearray()
+    frame_syncs = (0x1A86, 0x0579)
+    for frame_index in range(frame_count):
+        stream += BuildTSMFHeaderPacket(table, frame_syncs[frame_index % 2])
+        for slot in range(TSMF_SLOT_COUNT):
+            stream += BuildSlotPacket(slot)
+    return bytes(stream)
+
+
+class TestTSMFSplitCLI:
+    """isdb-tsmf-split CLI のテスト (合成データによる)"""
+
+    def _run_cli(self, args: list[str], stdin: bytes) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, '-m', 'isdb_scanner.catv.tsmf_split_cli', *args],
+            input=stdin,
+            capture_output=True,
+            cwd=REPOSITORY_ROOT,
+        )
+
+    def test_cli_rel_ts_output(self):
+        ts_stream = BuildSyntheticTSMFStream()
+        expected = TSMFDemultiplexer.demux_all(ts_stream)[1]
+        result = self._run_cli(['--rel-ts', '1'], ts_stream)
+        assert result.returncode == 0
+        assert result.stdout == bytes(expected)
+
+    def test_cli_list(self):
+        import json
+
+        ts_stream = BuildSyntheticTSMFStream()
+        result = self._run_cli(['--list'], ts_stream)
+        assert result.returncode == 0
+        info = json.loads(result.stdout)
+        assert info['carrier_type'] == 'TSMF'
+        assert set(info['relative_ts'].keys()) == {'1', '2'}

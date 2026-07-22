@@ -301,3 +301,34 @@ class TestMMTAnalyzerSynthetic:
         assert mmt_info.services == []
         assert mmt_info.is_multi_carrier_partial is False
 
+
+class TestMMTAnalyzerTruncatedSalvage:
+    """打ち切られたシグナリングパケット (8K マルチキャリア分散伝送で常態的に発生する) からの MPT 部分解析のテスト"""
+
+    def test_truncated_mpt_salvage(self):
+        # 宣言長より短く打ち切られた MPT を含むシグナリングパケットから、先頭アセットだけでもサルベージできること
+        video_asset = BuildAssetEntry(b'hev1', location_type=0x00, location_body=(0xF100).to_bytes(2, 'big'))
+        audio_asset = BuildAssetEntry(b'mp4a', location_type=0x00, location_body=(0xF110).to_bytes(2, 'big'))
+        mpt = BuildMPTTable(package_id=0x66, assets=[video_asset, audio_asset])
+        packet = BuildSignallingTLVPacket(packet_id=0x0000, message_body=mpt)
+
+        # TLV パケットの末尾 15 バイトを打ち切る (2番目のアセット (17バイト) の途中で切れ、先頭アセットは無傷で残る)
+        truncated = packet[: len(packet) - 15]
+        mmt_info = MMTAnalyzer().analyze(b'', truncated_packets=[truncated])
+
+        assert len(mmt_info.services) == 1
+        service = mmt_info.services[0]
+        assert service.package_id == 0x66
+        assert service.assets[0].asset_type == 'hev1'
+        assert service.assets[0].packet_id == 0xF100
+
+    def test_multi_carrier_detection_via_carrier_group(self):
+        # TSMF ヘッダ由来のキャリアグループ情報 (count >= 2) だけでもマルチキャリア分散伝送と判定されること
+        from isdb_scanner.catv.constants import TLVCarrierGroupInfo
+
+        carrier_group = TLVCarrierGroupInfo(
+            tlv_stream_id=0xB0E0, network_id=0x000B, group_id=1, group_carrier_count=3, group_carrier_index=1
+        )
+        mmt_info = MMTAnalyzer().analyze(b'', carrier_group=carrier_group)
+        assert mmt_info.is_multi_carrier_partial is True
+        assert mmt_info.carrier_group == carrier_group

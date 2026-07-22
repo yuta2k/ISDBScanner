@@ -26,10 +26,8 @@ from isdb_scanner.catv.tsmf import (
 TLV_SYNC_BYTE = 0x7F
 
 # TLV パケットの type (ARIB STD-B60)
-TLV_PACKET_TYPE_IPV4 = 0x02  # 非圧縮 IPv4 パケット
 TLV_PACKET_TYPE_COMPRESSED_IP = 0x03  # ヘッダ圧縮された IP パケット (この中に MMTP パケットが入っている)
 TLV_PACKET_TYPE_SIGNALING = 0xFE  # TLV-SI (TLV-NIT など)
-TLV_PACKET_TYPE_NULL = 0xFF  # Null パケット (スタッフィング用)
 
 # TLV-SI (type=0xFE) の table_id
 TLV_NIT_TABLE_ID = 0x40  # TLV-NIT (自ネットワーク)
@@ -54,7 +52,6 @@ _COMPRESSED_IP_HEADER_TYPE_FULL = (0x20, 0x21)
 _COMPRESSED_IP_HEADER_TYPE_COMPRESSED = (0x60, 0x61)
 
 # MMTP payload_type (ARIB STD-B60)
-MMT_PAYLOAD_TYPE_MPU = 0x00
 MMT_PAYLOAD_TYPE_SIGNALING_MESSAGE = 0x02
 
 # MMT_general_location_info() の location_type ごとの固定バイト長
@@ -422,7 +419,8 @@ def _TryParseMPTAsset(buf: bytes, offset: int, end: int, *, allow_truncated: boo
     offset += 4
     asset_id_length = buf[offset]
     offset += 1
-    if asset_id_length > _MAX_ASSET_ID_LENGTH or offset + asset_id_length + 5 > end:
+    # +6: asset_type(4B) + asset_clock_relation_flags(1B) + location_count(1B) までバッファ内に収まっている必要がある
+    if asset_id_length > _MAX_ASSET_ID_LENGTH or offset + asset_id_length + 6 > end:
         return None, offset
     offset += asset_id_length  # asset_id 自体は現時点では使わない
     asset_type = _DecodeFourCC(buf[offset : offset + 4])
@@ -548,12 +546,19 @@ def _ScanForMPT(buf: bytes, *, allow_truncated: bool = False) -> Iterator[MMTSer
     で検証するスキャン方式を採用している (妥当性チェック自体は _TryParseMPT / _TryParseMPTAsset で行う)
     """
 
-    for index in range(len(buf) - 4):
+    index = 0
+    while index < len(buf) - 4:
         if buf[index] != MMT_TABLE_ID_MPT:
+            index += 1
             continue
         service_info = _TryParseMPT(buf, index, allow_truncated=allow_truncated)
-        if service_info is not None:
-            yield service_info
+        if service_info is None:
+            index += 1
+            continue
+        yield service_info
+        # 正しく解析できたテーブルの内部を再スキャンしない (テーブル本文中の偶然の 0x20 を別の MPT と誤検出しないようにする)
+        table_length = (buf[index + 2] << 8) | buf[index + 3]
+        index = min(index + 4 + table_length, len(buf))
 
 
 def _ExtractSignallingMessageParts(payload: bytes) -> tuple[int, int, int, bool, bool, bytes] | None:

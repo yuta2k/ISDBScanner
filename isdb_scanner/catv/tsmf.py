@@ -38,8 +38,6 @@ class TSMFDemultiplexer:
         self._relative_stream_numbers: list[int] = []
         # 現在のフレーム内で処理済みのスロット数 (-1: フレーム未同期)
         self._slot_counter: int = -1
-        # これまでに検出した有効な多重フレームヘッダの数
-        self.header_count: int = 0
 
     def feed(self, packet: bytes | bytearray | memoryview) -> int | None:
         """
@@ -59,7 +57,6 @@ class TSMFDemultiplexer:
                 table.append(value & 0x0F)
             self._relative_stream_numbers = table
             self._slot_counter = 0
-            self.header_count += 1
             return None
 
         # フレーム未同期、または 52 スロットを使い切った後に次のヘッダが来ていない (フレーム同期ロスト) 場合は読み捨てる
@@ -118,11 +115,17 @@ class TSMFDemultiplexer:
                 offset += TS_PACKET_SIZE
             del buffer[:offset]
 
+    # detect_carrier_type() で TLV キャリアと判定するために必要な最低 TLV セル数
+    # (NULL だらけの Empty キャリアに紛れ込んだノイズパケットの誤検出を防ぐための安全弁)
+    MIN_TLV_CELL_COUNT = 100
+
     @staticmethod
     def detect_carrier_type(ts_stream: bytes | bytearray) -> CarrierType:
         """
         受信した TS ストリームからキャリア種別を判定する
         TLV キャリアも TSMF フレーム構造を持つ (スロットの中身が TLV セル) ため、TLV 判定を TSMF 判定より優先する
+        TLV 判定の割合は NULL パケットを除いた実データパケット数を分母にする
+        (8K マルチキャリア分散伝送などで空きスロットが NULL で埋まっていても、TLV セルが主体なら TLV と判定できるようにする)
         """
         total_count = 0
         tsmf_header_count = 0
@@ -145,7 +148,12 @@ class TSMFDemultiplexer:
                 null_count += 1
         if total_count == 0:
             return CarrierType.Empty
-        if tlv_cell_count / total_count > 0.5:
+        non_null_count = total_count - null_count
+        if (
+            tlv_cell_count >= TSMFDemultiplexer.MIN_TLV_CELL_COUNT
+            and non_null_count > 0
+            and tlv_cell_count / non_null_count > 0.5
+        ):
             return CarrierType.TLV
         if tsmf_header_count >= 2:
             return CarrierType.TSMF
