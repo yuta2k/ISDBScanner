@@ -345,6 +345,16 @@ class ServiceDiffInfo(BaseModel):
     # fmt: on
 
 
+class MMTServiceDiffInfo(BaseModel):
+    """スキャン差分レポートにおける、追加/削除/改名された MMT サービス (TLV キャリアの 4K/8K チャンネル) 1件分の情報"""
+
+    # fmt: off
+    package_id: int = -1                        # MPT の package_id
+    service_name: str = 'Unknown'                # 現在のサービス名 (削除の場合は削除される直前の名前)
+    previous_service_name: str | None = None    # 改名の場合のみ、変更前のサービス名 (追加/削除では None)
+    # fmt: on
+
+
 class CASChangeInfo(BaseModel):
     """スキャン差分レポートにおける、TS 単位の CAS 種別 (required_card) 変化 1件分の情報"""
 
@@ -377,6 +387,9 @@ class ChannelChangeInfo(BaseModel):
     added_services: list[ServiceDiffInfo] = []
     removed_services: list[ServiceDiffInfo] = []
     renamed_services: list[ServiceDiffInfo] = []
+    added_mmt_services: list[MMTServiceDiffInfo] = []      # TLV キャリアの MMT サービス (package_id 単位) の増減・改名
+    removed_mmt_services: list[MMTServiceDiffInfo] = []
+    renamed_mmt_services: list[MMTServiceDiffInfo] = []
     cas_changes: list[CASChangeInfo] = []
     retransmission_source_changes: list[RetransmissionSourceChangeInfo] = []
     # fmt: on

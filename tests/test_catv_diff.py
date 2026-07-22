@@ -4,8 +4,10 @@ from isdb_scanner.catv.constants import (
     CarrierType,
     CASInfo,
     CATVCarrierInfo,
+    CATVMMTInfo,
     CATVServiceInfo,
     CATVTransportStreamInfo,
+    MMTServiceInfo,
 )
 from isdb_scanner.catv.diff import CompareScanResults, FormatScanDiff
 
@@ -205,6 +207,51 @@ class TestCompareScanResultsChannelChanged:
         assert len(change.retransmission_source_changes) == 1
         assert change.retransmission_source_changes[0].previous_source == 'Terrestrial'
         assert change.retransmission_source_changes[0].current_source == 'BS'
+
+
+def BuildTLVCarrierDict(physical_channel: str, services: list[tuple[int, str]]) -> dict[str, Any]:
+    """テスト用に、TLV (4K/8K MMT) キャリアの CATV.json 1エントリ分の dict を組み立てる"""
+
+    carrier = CATVCarrierInfo(
+        physical_channel=physical_channel,
+        carrier_type=CarrierType.TLV,
+        transport_streams=[],
+        mmt=CATVMMTInfo(
+            services=[MMTServiceInfo(package_id=package_id, service_name=service_name) for package_id, service_name in services],
+        ),
+    )
+    return carrier.model_dump(mode='json')
+
+
+class TestCompareScanResultsMMTServices:
+    """TLV キャリア (transport_streams が空) の MMT サービス単位の差分検出のテスト"""
+
+    def test_mmt_service_added_removed_and_renamed(self):
+        previous = {'CATV_C36': BuildTLVCarrierDict('CATV_C36', [(0x01, 'Service A'), (0x02, 'Service B')])}
+        current = {'CATV_C36': BuildTLVCarrierDict('CATV_C36', [(0x01, 'Service A Renamed'), (0x03, 'Service C')])}
+
+        diff = CompareScanResults(previous, current)
+
+        assert len(diff.changed_channels) == 1
+        change = diff.changed_channels[0]
+
+        assert [service.package_id for service in change.added_mmt_services] == [0x03]
+        assert change.added_mmt_services[0].service_name == 'Service C'
+        assert [service.package_id for service in change.removed_mmt_services] == [0x02]
+        assert len(change.renamed_mmt_services) == 1
+        assert change.renamed_mmt_services[0].package_id == 0x01
+        assert change.renamed_mmt_services[0].previous_service_name == 'Service A'
+        assert change.renamed_mmt_services[0].service_name == 'Service A Renamed'
+
+        text = FormatScanDiff(diff)
+        assert '+ MMT service added: package_id=0x0003 (Service C)' in text
+        assert '- MMT service removed: package_id=0x0002 (Service B)' in text
+        assert '~ MMT service renamed: package_id=0x0001 "Service A" -> "Service A Renamed"' in text
+
+    def test_identical_mmt_services_no_change(self):
+        carrier_dict = BuildTLVCarrierDict('CATV_C36', [(0x01, 'Service A')])
+        diff = CompareScanResults({'CATV_C36': carrier_dict}, {'CATV_C36': carrier_dict})
+        assert diff.has_changes is False
 
 
 class TestFormatScanDiff:

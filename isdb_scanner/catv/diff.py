@@ -8,6 +8,7 @@ from isdb_scanner.catv.constants import (
     CATVTransportStreamInfo,
     ChannelChangeInfo,
     ChannelSummaryInfo,
+    MMTServiceDiffInfo,
     RetransmissionSourceChangeInfo,
     ScanDiff,
     ServiceDiffInfo,
@@ -152,6 +153,32 @@ def _CompareChannel(previous: CATVCarrierInfo, current: CATVCarrierInfo) -> Chan
             )
             has_change = True
 
+    # TLV (4K/8K MMT) キャリアは transport_streams が空のため、上記の TS 単位の比較では変化を検出できない
+    # MMT サービス (MPT の package_id 単位) の増減・改名をここで比較する
+    previous_mmt_services = {service.package_id: service for service in (previous.mmt.services if previous.mmt is not None else [])}
+    current_mmt_services = {service.package_id: service for service in (current.mmt.services if current.mmt is not None else [])}
+
+    for package_id in sorted(set(current_mmt_services) - set(previous_mmt_services)):
+        service = current_mmt_services[package_id]
+        change.added_mmt_services.append(MMTServiceDiffInfo(package_id=package_id, service_name=service.service_name))
+        has_change = True
+    for package_id in sorted(set(previous_mmt_services) - set(current_mmt_services)):
+        service = previous_mmt_services[package_id]
+        change.removed_mmt_services.append(MMTServiceDiffInfo(package_id=package_id, service_name=service.service_name))
+        has_change = True
+    for package_id in sorted(set(previous_mmt_services) & set(current_mmt_services)):
+        previous_service = previous_mmt_services[package_id]
+        current_service = current_mmt_services[package_id]
+        if previous_service.service_name != current_service.service_name:
+            change.renamed_mmt_services.append(
+                MMTServiceDiffInfo(
+                    package_id=package_id,
+                    service_name=current_service.service_name,
+                    previous_service_name=previous_service.service_name,
+                )
+            )
+            has_change = True
+
     return change if has_change else None
 
 
@@ -237,6 +264,16 @@ def FormatScanDiff(diff: ScanDiff) -> str:
                     f'    ~ Service renamed: TSID={service_diff.transport_stream_id:#06x} '
                     f'service_id={service_diff.service_id} '
                     f'"{service_diff.previous_service_name}" -> "{service_diff.service_name}"'
+                )
+
+            for mmt_diff in change.added_mmt_services:
+                lines.append(f'    + MMT service added: package_id={mmt_diff.package_id:#06x} ({mmt_diff.service_name})')
+            for mmt_diff in change.removed_mmt_services:
+                lines.append(f'    - MMT service removed: package_id={mmt_diff.package_id:#06x} ({mmt_diff.service_name})')
+            for mmt_diff in change.renamed_mmt_services:
+                lines.append(
+                    f'    ~ MMT service renamed: package_id={mmt_diff.package_id:#06x} '
+                    f'"{mmt_diff.previous_service_name}" -> "{mmt_diff.service_name}"'
                 )
 
             for cas_change in change.cas_changes:
