@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from rich import print
+
 from isdb_scanner.analyzer import TransportStreamAnalyzer
-from isdb_scanner.catv.cas import AnalyzeCAS, ExtractSDTFreeCAModeMap, ExtractTransportStreamId
+from isdb_scanner.catv.cas import AnalyzeCAS, ExtractSDTFreeCAModeMap, ParsePAT
 from isdb_scanner.catv.constants import (
     CarrierType,
     CATVCarrierInfo,
@@ -89,13 +91,14 @@ class CATVCarrierAnalyzer:
 
         # NIT には同一ネットワークに属する他の TS の情報も含まれているため、「自 TS」の特定は NIT 経由ではなく、
         # 自 TS 自身の PAT (transport_stream_id) から直接行う方が確実
-        transport_stream_id = ExtractTransportStreamId(ts_stream)
+        transport_stream_id, pmt_pids = ParsePAT(ts_stream)
         if transport_stream_id is None:
             # PAT すら取得できない = 解析不能なストリーム (ノイズ・分離漏れなど)
             return None
 
-        cas_info = AnalyzeCAS(ts_stream)
+        # PAT / SDT の解析結果は AnalyzeCAS にも渡し、同じテーブルを二重にパースしないようにする
         free_ca_mode_map = ExtractSDTFreeCAModeMap(ts_stream)
+        cas_info = AnalyzeCAS(ts_stream, pmt_pids=pmt_pids, free_ca_mode_map=free_ca_mode_map)
 
         # 既存の TransportStreamAnalyzer (ariblib ベース) で NIT/SDT からネットワーク情報・サービス名などを取得する
         # ariblib は破損データや未対応の記述子を含む TS で例外を送出することがあるため、
@@ -109,7 +112,14 @@ class CATVCarrierAnalyzer:
             # "T" から始まらない文字列であれば、地上波専用の assert 分岐 (常に1TSのみ想定) には入らないため安全
             ts_infos = TransportStreamAnalyzer(bytearray(ts_stream), self.physical_channel).analyze()
             analyze_succeeded = True
-        except Exception:
+        except Exception as ex:
+            # 解析失敗はスキャン全体を止めるほどではないが、黙って握り潰すと「受信できたのに情報が空」の原因が
+            # 分からなくなるため、劣化した結果を返すことを警告として表示しておく
+            print(
+                f'[yellow]Warning: NIT/SDT analysis failed for {self.physical_channel} '
+                f'(TSID={transport_stream_id:#06x}): {type(ex).__name__}: {ex}[/yellow]'
+            )
+            print('[yellow]Network name and service list will be empty for this TS.[/yellow]')
             ts_infos = []
 
         if analyze_succeeded:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from isdb_scanner.catv.constants import CASInfo
+from isdb_scanner.catv.constants import CA_SYSTEM_ID_NAMES, CASInfo
 from isdb_scanner.catv.tsmf import TS_PACKET_SIZE, TS_SYNC_BYTE, GetPID
 
 
@@ -10,6 +10,9 @@ from isdb_scanner.catv.tsmf import TS_PACKET_SIZE, TS_SYNC_BYTE, GetPID
 CA_DESCRIPTOR_TAG = 0x09
 # スクランブル判定の閾値 (この割合未満なら「実質スクランブルされていない」とみなす)
 SCRAMBLE_RATIO_NONE_THRESHOLD = 0.01
+
+# カード種別名 → CA_system_id の逆引き (constants.py の CA_SYSTEM_ID_NAMES を単一の情報源とする)
+_CA_SYSTEM_ID_BY_NAME = {name: ca_system_id for ca_system_id, name in CA_SYSTEM_ID_NAMES.items()}
 
 # MPEG-2 PSI の CRC32 (CRC-32/MPEG-2: 反転なし・初期値 0xFFFFFFFF・xorout 0x00000000) の生成多項式
 _CRC32_MPEG_POLYNOMIAL = 0x04C11DB7
@@ -111,7 +114,7 @@ def _IterSections(ts_stream: bytes | bytearray, target_pid: int) -> Iterator[byt
                 break
 
 
-def _ParsePAT(ts_stream: bytes | bytearray) -> tuple[int | None, dict[int, int]]:
+def ParsePAT(ts_stream: bytes | bytearray) -> tuple[int | None, dict[int, int]]:
     """
     PAT (Program Association Table, PID 0x0000) を解析し、(transport_stream_id, {program_number: PMT の PID}) を返す
     実データでは PAT は 1 セクションに収まることがほとんどのため、最初に見つかった有効なセクションのみを処理する
@@ -132,16 +135,19 @@ def _ParsePAT(ts_stream: bytes | bytearray) -> tuple[int | None, dict[int, int]]
 
 def ExtractTransportStreamId(ts_stream: bytes | bytearray) -> int | None:
     """PAT から自 TS の transport_stream_id を取得する (PAT が取得できない場合は None)"""
-    transport_stream_id, _ = _ParsePAT(ts_stream)
+    transport_stream_id, _ = ParsePAT(ts_stream)
     return transport_stream_id
 
 
-def _ExtractCASystemIds(ts_stream: bytes | bytearray, pmt_pids: dict[int, int]) -> set[int]:
-    """CAT (PID 0x0001) と、指定された全 PMT の第1ループ (番組情報記述子) から CA_system_id を収集する"""
+def _ExtractCASystemIds(pid_streams: dict[int, bytearray], pmt_pids: dict[int, int]) -> set[int]:
+    """
+    PID ごとに収集済みのパケット列 (_CollectPIDStreams 相当の dict) から、
+    CAT (PID 0x0001) と全 PMT の第1ループ (番組情報記述子) の CA_system_id を収集する
+    """
     ca_system_ids: set[int] = set()
 
     # CAT (Conditional Access Table): 実データでは 1 セクションに収まることがほとんどのため、最初の有効なセクションのみ処理する
-    for section in _IterSections(ts_stream, 0x0001):
+    for section in _IterSections(pid_streams.get(0x0001, b''), 0x0001):
         if section[0] != 0x01:  # table_id: conditional_access_section
             continue
         for tag, body in _ParseDescriptors(section[8:-4]):
@@ -151,7 +157,7 @@ def _ExtractCASystemIds(ts_stream: bytes | bytearray, pmt_pids: dict[int, int]) 
 
     # PMT (Program Map Table): PAT から得られた全プログラムを対象にする (probe 実装にあった先頭6件制限は撤廃)
     for pid in pmt_pids.values():
-        for section in _IterSections(ts_stream, pid):
+        for section in _IterSections(pid_streams.get(pid, b''), pid):
             if section[0] != 0x02:  # table_id: program_map_section
                 continue
             program_info_length = ((section[10] & 0x0F) << 8) | section[11]
@@ -184,24 +190,39 @@ def ExtractSDTFreeCAModeMap(ts_stream: bytes | bytearray) -> dict[int, bool]:
     return free_ca_mode_map
 
 
-def AnalyzeCAS(ts_stream: bytes | bytearray) -> CASInfo:
+def AnalyzeCAS(
+    ts_stream: bytes | bytearray,
+    *,
+    pmt_pids: dict[int, int] | None = None,
+    free_ca_mode_map: dict[int, bool] | None = None,
+) -> CASInfo:
     """
     TS ストリーム (TSMF の場合は分離済みの単一 TS 分) から CAS (限定受信システム) 関連の情報を解析する
+    スクランブル率の集計と CAT/PMT/SDT の対象 PID パケット収集を 1 回の走査で同時に行うため、
+    多重ストリーム全体を PID ごとに何度も再走査しない
 
     Args:
         ts_stream (bytes | bytearray): 188 バイト境界に整列済みの TS ストリーム (単一 TS 分)
+        pmt_pids (dict[int, int] | None): PAT 解析済みの {program_number: PMT の PID} (省略時はここで PAT を解析する)
+        free_ca_mode_map (dict[int, bool] | None): SDT 解析済みの {service_id: is_free} (省略時はここで SDT を解析する)
 
     Returns:
         CASInfo: CAS 関連の解析結果
     """
 
-    _, pmt_pids = _ParsePAT(ts_stream)
-    ca_system_ids = _ExtractCASystemIds(ts_stream, pmt_pids)
+    if pmt_pids is None:
+        _, pmt_pids = ParsePAT(ts_stream)
 
-    # スクランブル率: 全 TS パケットのうち transport_scrambling_control (先頭から4バイト目の上位2bit) が
-    # 0 (非スクランブル) 以外になっているものの割合
+    # 収集対象の PID: CAT (0x0001) + 全 PMT。free_ca_mode_map が未指定なら SDT (0x0011) も同じ走査で収集する
+    target_pids = {0x0001, *pmt_pids.values()}
+    if free_ca_mode_map is None:
+        target_pids.add(0x0011)
+
+    # スクランブル率の集計 (transport_scrambling_control (先頭から4バイト目の上位2bit) が 0 以外の割合) と、
+    # 対象 PID のパケット収集を 1 回の走査で同時に行う
     total_packet_count = 0
     scrambled_packet_count = 0
+    pid_streams: dict[int, bytearray] = {pid: bytearray() for pid in target_pids}
     view = memoryview(ts_stream)
     for offset in range(0, len(ts_stream) - TS_PACKET_SIZE + 1, TS_PACKET_SIZE):
         packet = view[offset : offset + TS_PACKET_SIZE]
@@ -210,19 +231,25 @@ def AnalyzeCAS(ts_stream: bytes | bytearray) -> CASInfo:
         total_packet_count += 1
         if packet[3] & 0xC0:
             scrambled_packet_count += 1
+        pid = GetPID(packet)
+        if pid in pid_streams:
+            pid_streams[pid].extend(packet)
     scramble_ratio = (scrambled_packet_count / total_packet_count) if total_packet_count > 0 else 0.0
 
-    free_ca_mode_map = ExtractSDTFreeCAModeMap(ts_stream)
+    ca_system_ids = _ExtractCASystemIds(pid_streams, pmt_pids)
+
+    if free_ca_mode_map is None:
+        free_ca_mode_map = ExtractSDTFreeCAModeMap(pid_streams[0x0011])
     has_free_ca_mode_service = any(not is_free for is_free in free_ca_mode_map.values())
 
-    # 受信に必要な CAS カードの種別を判定する
+    # 受信に必要な CAS カードの種別を判定する (CA_system_id とカード名の対応は constants.py の CA_SYSTEM_ID_NAMES を参照)
     if scramble_ratio < SCRAMBLE_RATIO_NONE_THRESHOLD:
         # ほぼスクランブルされていない = 無料放送のみでカード不要
         required_card = 'none'
-    elif 0x0006 in ca_system_ids:
-        # C-CAS (0x0006) と B-CAS (0x0005) の両方が見つかった場合は、CATV 事業者による再スクランブルの可能性が高い C-CAS を優先する
+    elif _CA_SYSTEM_ID_BY_NAME['C-CAS'] in ca_system_ids:
+        # C-CAS と B-CAS の両方が見つかった場合は、CATV 事業者による再スクランブルの可能性が高い C-CAS を優先する
         required_card = 'C-CAS'
-    elif 0x0005 in ca_system_ids:
+    elif _CA_SYSTEM_ID_BY_NAME['B-CAS'] in ca_system_ids:
         required_card = 'B-CAS'
     else:
         # スクランブルされているが CA 記述子が見つからない、または未知の CA_system_id しかない場合

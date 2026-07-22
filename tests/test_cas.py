@@ -169,3 +169,22 @@ class TestAnalyzeCASSynthetic:
         stream = BuildSectionPacket(0x0000, corrupted_section)
         assert ExtractTransportStreamId(stream) is None
 
+
+class TestAnalyzeCASPrecomputedInputs:
+    """PAT/SDT の解析結果を事前に渡した場合の AnalyzeCAS のテスト (analyzer.py からの二重パース回避パス)"""
+
+    def test_precomputed_pmt_pids_and_free_ca_mode_map(self):
+        transport_stream_id = 0x1234
+        pmt_pid = 0x0100
+        stream = bytearray()
+        stream += BuildSectionPacket(0x0000, BuildPATSection(transport_stream_id, {1: pmt_pid}))
+        stream += BuildSectionPacket(0x0001, BuildCATSection([0x0005]))
+        stream += BuildSectionPacket(pmt_pid, BuildPMTSection(1, pmt_pid, [0x0005]))
+        for i in range(60):
+            stream += BuildElementaryStreamPacket(0x0101, scrambled=True, continuity_counter=i)
+
+        # SDT を含まないストリームでも、free_ca_mode_map を渡せば SDT の再解析なしで判定できる
+        cas_info = AnalyzeCAS(stream, pmt_pids={1: pmt_pid}, free_ca_mode_map={1: True, 2: False})
+        assert cas_info.ca_system_ids == [0x0005]
+        assert cas_info.required_card == 'B-CAS'
+        assert cas_info.has_free_ca_mode_service is True
