@@ -9,21 +9,19 @@ from ruamel.yaml import YAML
 from typing_extensions import TypedDict
 
 from isdb_scanner.catv.constants import (
-    CATV_DELIVERY_SYSTEM,
     CATV_FREQUENCY_TABLE,
-    CATV_MODULATION,
-    CATV_SYMBOL_RATE,
+    BuildDvbv5ConfEntryLines,
     CarrierType,
     CATVCarrierInfo,
     CATVTransportStreamInfo,
 )
 
 
-class CATVJSONFormatter:
+class CATVBaseFormatter:
     """
-    CATV キャリアのスキャン解析結果 (CATVCarrierInfo のリスト) を JSON データとして保存するフォーマッター
-    既存の isdb_scanner/formatter.py の BaseFormatter は地上波/BS/CS の3リスト固定のコンストラクタ引数を取るためシグネチャが合わず、
-    CATV では継承せず独自の単純なクラスとして実装している (出力スタイルは既存 JSONFormatter を参考にしている)
+    CATV スキャン結果 (CATVCarrierInfo のリスト) 用フォーマッターの基底クラス
+    既存の isdb_scanner/formatter.py の BaseFormatter は地上波/BS/CS の3リスト固定のコンストラクタ引数を取るため
+    シグネチャが合わず、CATV ではこの独自の基底クラスを使う (出力スタイルは既存フォーマッターを参考にしている)
     """
 
     def __init__(self, save_file_path: Path, carriers: list[CATVCarrierInfo]) -> None:
@@ -37,15 +35,9 @@ class CATVJSONFormatter:
         self._carriers = carriers
 
     def format(self) -> str:
-        """
-        JSON データとしてフォーマットする (物理チャンネル名をキーにした dict)
+        """フォーマットを実行する (サブクラスで実装する)"""
 
-        Returns:
-            str: フォーマットされた文字列
-        """
-
-        channels_dict = {carrier.physical_channel: carrier.model_dump(mode='json') for carrier in self._carriers}
-        return json.dumps(channels_dict, indent=4, ensure_ascii=False)
+        raise NotImplementedError
 
     def save(self) -> str:
         """
@@ -62,23 +54,56 @@ class CATVJSONFormatter:
         return formatted_str
 
 
-class CATVDvbv5ConfFormatter:
+def _DumpChannelsYaml(channels: list) -> str:
+    """チャンネル一覧を Mirakurun/mirakc 向けの共通スタイル (インデント幅など) で YAML 文字列に変換する"""
+
+    string_io = StringIO()
+    yaml = YAML()
+    yaml.width = 1000
+    yaml.preserve_quotes = True
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    yaml.dump(channels, string_io)
+    string_io.seek(0)
+    return string_io.getvalue()
+
+
+def _BuildExcludedTLVChannelLines(carriers: list[CATVCarrierInfo], recorder_name: str) -> list[str]:
+    """TLV (4K/8K MMT) キャリアを出力から除外した旨の注記コメント行を組み立てる (該当キャリアがなければ空リスト)"""
+
+    excluded_tlv_channels = sorted(
+        carrier.physical_channel for carrier in carriers if carrier.carrier_type == CarrierType.TLV
+    )
+    if len(excluded_tlv_channels) == 0:
+        return []
+    return [
+        '#',
+        f'# 以下の物理チャンネルは TLV/MMT (4K/8K) キャリアのため、TS ベースの {recorder_name} では扱えず除外しています:',
+        f'#   {", ".join(excluded_tlv_channels)}',
+    ]
+
+
+class CATVJSONFormatter(CATVBaseFormatter):
+    """CATV キャリアのスキャン解析結果 (CATVCarrierInfo のリスト) を JSON データとして保存するフォーマッター"""
+
+    def format(self) -> str:
+        """
+        JSON データとしてフォーマットする (物理チャンネル名をキーにした dict)
+
+        Returns:
+            str: フォーマットされた文字列
+        """
+
+        channels_dict = {carrier.physical_channel: carrier.model_dump(mode='json') for carrier in self._carriers}
+        return json.dumps(channels_dict, indent=4, ensure_ascii=False)
+
+
+class CATVDvbv5ConfFormatter(CATVBaseFormatter):
     """
     CATV キャリアのスキャン結果のうち、受信できた (Empty でない) キャリアのみを dvbv5 形式の conf ファイルとして保存するフォーマッター
     ここで出力される conf ファイルは dvbv5-zap 標準の書式で、
     将来 mirakc などから `dvbv5-zap -c <このファイル> ...` で直接選局できるようにすることを目的としている
     (CATVTuner が内部的に生成する全チャンネル分の conf とは異なり、こちらは実際にロックできたチャンネルのみを含む)
     """
-
-    def __init__(self, save_file_path: Path, carriers: list[CATVCarrierInfo]) -> None:
-        """
-        Args:
-            save_file_path (Path): 保存先のファイルパス
-            carriers (list[CATVCarrierInfo]): スキャン結果の CATV キャリア情報のリスト
-        """
-
-        self._save_file_path = save_file_path
-        self._carriers = carriers
 
     def format(self) -> str:
         """
@@ -97,29 +122,11 @@ class CATVDvbv5ConfFormatter:
             if frequency is None:
                 # 周波数プランに存在しない物理チャンネル名 (通常到達しないはずだが念のためスキップ)
                 continue
-            lines.append(f'[{carrier.physical_channel}]')
-            lines.append(f'\tDELIVERY_SYSTEM = {CATV_DELIVERY_SYSTEM}')
-            lines.append(f'\tFREQUENCY = {frequency}')
-            lines.append(f'\tSYMBOL_RATE = {CATV_SYMBOL_RATE}')
-            lines.append(f'\tMODULATION = {CATV_MODULATION}')
+            lines.extend(BuildDvbv5ConfEntryLines(carrier.physical_channel, frequency))
 
         if len(lines) == 0:
             return ''
         return '\n'.join(lines) + '\n'
-
-    def save(self) -> str:
-        """
-        フォーマットを実行し、結果をファイルに保存する
-
-        Returns:
-            str: フォーマットされた文字列
-        """
-
-        formatted_str = self.format()
-        with open(self._save_file_path, mode='w', encoding='utf-8') as f:
-            f.write(formatted_str)
-
-        return formatted_str
 
 
 def _BuildCATVChannelName(ts_info: CATVTransportStreamInfo) -> str:
@@ -174,7 +181,7 @@ CATVMirakurunChannel = TypedDict(
 )
 
 
-class CATVMirakurunChannelsYmlFormatter:
+class CATVMirakurunChannelsYmlFormatter(CATVBaseFormatter):
     """
     CATV キャリアのスキャン解析結果 (CATVCarrierInfo のリスト) から Mirakurun 用の channels.yml (CATV 分) を生成するフォーマッター
 
@@ -186,16 +193,6 @@ class CATVMirakurunChannelsYmlFormatter:
     対象は carrier_type が TSMF/SingleTS の TS のみで、TLV (4K/8K MMT) キャリアと Empty (受信不可) キャリアは対象外
     (TLV は TS ベースの Mirakurun では扱えないため、除外した物理チャンネルをコメントで注記する)
     """
-
-    def __init__(self, save_file_path: Path, carriers: list[CATVCarrierInfo]) -> None:
-        """
-        Args:
-            save_file_path (Path): 保存先のファイルパス
-            carriers (list[CATVCarrierInfo]): スキャン結果の CATV キャリア情報のリスト
-        """
-
-        self._save_file_path = save_file_path
-        self._carriers = carriers
 
     def format(self) -> str:
         """
@@ -223,16 +220,7 @@ class CATVMirakurunChannelsYmlFormatter:
             '# 管理する) を意図した値だが、dvbv5-zap の `-t` はロックタイムアウトと録画時間を兼ねる特殊仕様のため、',
             '# 実運用に組み込む際は実機で `-t 0` の挙動 (無制限に出力し続けるか) を確認してから使うこと',
         ]
-
-        excluded_tlv_channels = sorted(
-            carrier.physical_channel for carrier in self._carriers if carrier.carrier_type == CarrierType.TLV
-        )
-        if len(excluded_tlv_channels) > 0:
-            header_lines.append('#')
-            header_lines.append(
-                '# 以下の物理チャンネルは TLV/MMT (4K/8K) キャリアのため、TS ベースの Mirakurun では扱えず除外しています:'
-            )
-            header_lines.append(f'#   {", ".join(excluded_tlv_channels)}')
+        header_lines.extend(_BuildExcludedTLVChannelLines(self._carriers, 'Mirakurun'))
 
         channels: list[CATVMirakurunChannel] = []
         for carrier, ts_info in _IterReceivableTransportStreams(self._carriers):
@@ -246,29 +234,7 @@ class CATVMirakurunChannelsYmlFormatter:
             channel['isDisabled'] = False
             channels.append(channel)
 
-        string_io = StringIO()
-        yaml = YAML()
-        yaml.width = 1000
-        yaml.preserve_quotes = True
-        yaml.indent(mapping=2, sequence=4, offset=2)
-        yaml.dump(channels, string_io)
-        string_io.seek(0)
-
-        return '\n'.join(header_lines) + '\n\n' + string_io.getvalue()
-
-    def save(self) -> str:
-        """
-        フォーマットを実行し、結果をファイルに保存する
-
-        Returns:
-            str: フォーマットされた文字列
-        """
-
-        formatted_str = self.format()
-        with open(self._save_file_path, mode='w', encoding='utf-8') as f:
-            f.write(formatted_str)
-
-        return formatted_str
+        return '\n'.join(header_lines) + '\n\n' + _DumpChannelsYaml(channels)
 
 
 CATVMirakcChannel = TypedDict(
@@ -283,7 +249,7 @@ CATVMirakcChannel = TypedDict(
 )
 
 
-class CATVMirakcConfigYmlFormatter:
+class CATVMirakcConfigYmlFormatter(CATVBaseFormatter):
     """
     CATV キャリアのスキャン解析結果 (CATVCarrierInfo のリスト) から mirakc 用の channels 設定断片 (CATV 分) を生成するフォーマッター
 
@@ -299,16 +265,6 @@ class CATVMirakcConfigYmlFormatter:
     (tuners 側の具体的な command テンプレートは環境 (アダプタ数・isdb-tsmf-split の組み込み方) によって変わるため、
     コメント内の例として示すに留める)
     """
-
-    def __init__(self, save_file_path: Path, carriers: list[CATVCarrierInfo]) -> None:
-        """
-        Args:
-            save_file_path (Path): 保存先のファイルパス
-            carriers (list[CATVCarrierInfo]): スキャン結果の CATV キャリア情報のリスト
-        """
-
-        self._save_file_path = save_file_path
-        self._carriers = carriers
 
     def format(self) -> str:
         """
@@ -339,16 +295,7 @@ class CATVMirakcConfigYmlFormatter:
             '#   あるいは `| isdb-tsmf-split --rel-ts N` を固定で埋め込んだチューナーを channel 数だけ用意する',
             '#   など、環境に応じた組み込み方を検討すること (extra-args の値自体は正しい相対 TS 番号を示す)',
         ]
-
-        excluded_tlv_channels = sorted(
-            carrier.physical_channel for carrier in self._carriers if carrier.carrier_type == CarrierType.TLV
-        )
-        if len(excluded_tlv_channels) > 0:
-            header_lines.append('#')
-            header_lines.append(
-                '# 以下の物理チャンネルは TLV/MMT (4K/8K) キャリアのため、TS ベースの mirakc では扱えず除外しています:'
-            )
-            header_lines.append(f'#   {", ".join(excluded_tlv_channels)}')
+        header_lines.extend(_BuildExcludedTLVChannelLines(self._carriers, 'mirakc'))
 
         channels: list[CATVMirakcChannel] = []
         for carrier, ts_info in _IterReceivableTransportStreams(self._carriers):
@@ -362,26 +309,4 @@ class CATVMirakcConfigYmlFormatter:
             }
             channels.append(channel)
 
-        string_io = StringIO()
-        yaml = YAML()
-        yaml.width = 1000
-        yaml.preserve_quotes = True
-        yaml.indent(mapping=2, sequence=4, offset=2)
-        yaml.dump(channels, string_io)
-        string_io.seek(0)
-
-        return '\n'.join(header_lines) + '\n\n' + string_io.getvalue()
-
-    def save(self) -> str:
-        """
-        フォーマットを実行し、結果をファイルに保存する
-
-        Returns:
-            str: フォーマットされた文字列
-        """
-
-        formatted_str = self.format()
-        with open(self._save_file_path, mode='w', encoding='utf-8') as f:
-            f.write(formatted_str)
-
-        return formatted_str
+        return '\n'.join(header_lines) + '\n\n' + _DumpChannelsYaml(channels)

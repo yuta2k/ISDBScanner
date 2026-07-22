@@ -1,14 +1,18 @@
+import json
 from pathlib import Path
 
 from ruamel.yaml import YAML
 
 from isdb_scanner.catv.constants import (
+    CATV_FREQUENCY_TABLE,
     CarrierType,
     CATVCarrierInfo,
     CATVServiceInfo,
     CATVTransportStreamInfo,
 )
 from isdb_scanner.catv.formatter import (
+    CATVDvbv5ConfFormatter,
+    CATVJSONFormatter,
     CATVMirakcConfigYmlFormatter,
     CATVMirakurunChannelsYmlFormatter,
 )
@@ -17,6 +21,74 @@ from isdb_scanner.catv.formatter import (
 def LoadYaml(text: str):
     """テスト用に YAML 文字列 (先頭のコメント行を除く) をパースして Python オブジェクトに変換する"""
     return YAML().load(text)
+
+
+class TestCATVJSONFormatterSynthetic:
+    """合成データによる CATVJSONFormatter のテスト (CI でも実行可能)"""
+
+    def test_format_contains_expected_fields(self, tmp_path: Path):
+        carriers = BuildSyntheticCarriers()
+
+        formatter = CATVJSONFormatter(tmp_path / 'CATV.json', carriers)
+        result = json.loads(formatter.format())
+
+        # 物理チャンネル名をキーにした dict になっていること
+        assert set(result.keys()) == {'CATV_15', 'CATV_28', 'CATV_C36', 'CATV_C62'}
+
+        assert result['CATV_15']['physical_channel'] == 'CATV_15'
+        assert result['CATV_15']['carrier_type'] == 'TSMF'
+        ts_info = next(ts for ts in result['CATV_15']['transport_streams'] if ts['tsmf_relative_ts_number'] == 1)
+        assert ts_info['transport_stream_id'] == 0x1000
+        assert ts_info['network_name'] == 'サンプル放送'
+        assert ts_info['retransmission_source'] == 'Terrestrial'
+
+        # Empty キャリアは transport_streams が空のまま出力される
+        assert result['CATV_C62']['carrier_type'] == 'Empty'
+        assert result['CATV_C62']['transport_streams'] == []
+
+    def test_save_writes_file(self, tmp_path: Path):
+        carriers = BuildSyntheticCarriers()
+        save_path = tmp_path / 'CATV.json'
+
+        formatted_str = CATVJSONFormatter(save_path, carriers).save()
+
+        assert save_path.is_file()
+        assert save_path.read_text(encoding='utf-8') == formatted_str
+        assert json.loads(formatted_str)['CATV_28']['transport_streams'][0]['transport_stream_id'] == 0x2000
+
+
+class TestCATVDvbv5ConfFormatterSynthetic:
+    """合成データによる CATVDvbv5ConfFormatter のテスト (CI でも実行可能)"""
+
+    def test_format_only_includes_receivable_carriers(self, tmp_path: Path):
+        carriers = BuildSyntheticCarriers()
+
+        formatted_str = CATVDvbv5ConfFormatter(tmp_path / 'dvbv5_channels_catv.conf', carriers).format()
+
+        assert '[CATV_15]' in formatted_str
+        assert f'\tFREQUENCY = {CATV_FREQUENCY_TABLE["CATV_15"]}' in formatted_str
+        assert '\tDELIVERY_SYSTEM = DVBC/ANNEX_A' in formatted_str
+        assert '\tSYMBOL_RATE = 5274000' in formatted_str
+        assert '\tMODULATION = QAM/AUTO' in formatted_str
+        # TLV キャリアは (Mirakurun/mirakc の出力からは除外されるが) 受信はできているので conf には含まれる
+        assert '[CATV_C36]' in formatted_str
+        # Empty キャリア (受信不可) は出力に含まれない
+        assert '[CATV_C62]' not in formatted_str
+
+    def test_format_empty_when_no_receivable_carriers(self, tmp_path: Path):
+        carriers = [CATVCarrierInfo(physical_channel='CATV_C62', carrier_type=CarrierType.Empty, transport_streams=[])]
+
+        formatted_str = CATVDvbv5ConfFormatter(tmp_path / 'dvbv5_channels_catv.conf', carriers).format()
+        assert formatted_str == ''
+
+    def test_save_writes_file(self, tmp_path: Path):
+        carriers = BuildSyntheticCarriers()
+        save_path = tmp_path / 'dvbv5_channels_catv.conf'
+
+        formatted_str = CATVDvbv5ConfFormatter(save_path, carriers).save()
+
+        assert save_path.is_file()
+        assert save_path.read_text(encoding='utf-8') == formatted_str
 
 
 def BuildSyntheticCarriers() -> list[CATVCarrierInfo]:
@@ -184,4 +256,5 @@ class TestCATVMirakcConfigYmlFormatterSynthetic:
 
         assert save_path.is_file()
         assert save_path.read_text(encoding='utf-8') == formatted_str
+
 

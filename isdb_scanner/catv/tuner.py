@@ -14,10 +14,8 @@ from pathlib import Path
 from typing import BinaryIO, ClassVar
 
 from isdb_scanner.catv.constants import (
-    CATV_DELIVERY_SYSTEM,
     CATV_FREQUENCY_TABLE,
-    CATV_MODULATION,
-    CATV_SYMBOL_RATE,
+    BuildDvbv5ConfEntryLines,
     CATVSignalStats,
 )
 from isdb_scanner.tuner import TunerOpeningError, TunerOutputError, TunerTuningError
@@ -34,9 +32,11 @@ READ_CHUNK_SIZE = TS_PACKET_SIZE * 1024
 ## それ未満の場合は選局に失敗しているとみなす (既存 ISDBTuner.tune() の閾値と同じ)
 MIN_OUTPUT_SIZE = 100 * 1024
 
-# DVBv5 ioctl (FE_GET_PROPERTY) で信号品質統計を取得する際に使う定数
+# DVBv5 ioctl (FE_GET_PROPERTY / FE_GET_INFO) で使う定数
 # 値は Linux Kernel の include/uapi/linux/dvb/frontend.h (enum fe_property / enum fecap_scale_params) の定義そのもの
 FE_GET_PROPERTY = 0x80106F53
+FE_GET_INFO = 0x80A86F3D
+DTV_ENUM_DELSYS = 44
 DTV_STAT_SIGNAL_STRENGTH = 62
 DTV_STAT_CNR = 63
 DTV_STAT_PRE_ERROR_BIT_COUNT = 64
@@ -46,6 +46,49 @@ FE_SCALE_NOT_AVAILABLE = 0
 FE_SCALE_DECIBEL = 1
 FE_SCALE_RELATIVE = 2
 FE_SCALE_COUNTER = 3
+
+
+# DVBv5 ioctl 用の ctypes 構造体定義
+# 既存 isdb_scanner/tuner.py の ISDBTuner.getDVBDeviceInfoFromDVBv5() 内の定義と同じもの (既存コードは無改変のため、
+# ここでモジュールレベルに一度だけ定義し、CATVTuner 内の各 ioctl 呼び出しで共用する)
+class DtvProperty(ctypes.Structure):
+    class _u(ctypes.Union):
+        class _buffer(ctypes.Structure):
+            _fields_ = [
+                ('data', ctypes.c_uint8 * 32),
+                ('len', ctypes.c_uint32),
+                ('reserved1', ctypes.c_uint32 * 3),
+                ('reserved2', ctypes.c_void_p),
+            ]
+
+        _fields_ = [('data', ctypes.c_uint32), ('buffer', _buffer)]
+
+    _fields_ = [
+        ('cmd', ctypes.c_uint32),
+        ('reserved', ctypes.c_uint32 * 3),
+        ('u', _u),
+        ('result', ctypes.c_int),
+    ]
+
+
+class DtvProperties(ctypes.Structure):
+    _fields_ = [('num', ctypes.c_uint32), ('props', ctypes.POINTER(DtvProperty))]
+
+
+class DvbFrontendInfo(ctypes.Structure):
+    _fields_ = [
+        ('name', ctypes.c_char * 128),
+        ('type', ctypes.c_uint),
+        ('frequency_min', ctypes.c_uint32),
+        ('frequency_max', ctypes.c_uint32),
+        ('frequency_stepsize', ctypes.c_uint32),
+        ('frequency_tolerance', ctypes.c_uint32),
+        ('symbol_rate_min', ctypes.c_uint32),
+        ('symbol_rate_max', ctypes.c_uint32),
+        ('symbol_rate_tolerance', ctypes.c_uint32),
+        ('notifier_delay', ctypes.c_uint32),
+        ('caps', ctypes.c_uint),
+    ]
 
 # 選局 (ロック) 検知から信号品質統計を取得するまでの待機時間 (秒)
 # 実機 (Digital Devices Max M4) で確認したところ、ロック直後は DTV_STAT_PRE_ERROR_BIT_COUNT / DTV_STAT_PRE_TOTAL_BIT_COUNT
@@ -91,15 +134,8 @@ class CATVTuner:
         self.output_recisdb_log = output_recisdb_log
         self.device_path = Path(f'/dev/dvb/adapter{adapter_number}/frontend{frontend_number}')
 
-        # 前回チューナーオープンが失敗した (TunerOpeningError が発生した) かどうか
-        self._last_tuner_opening_failed = False
-
         # 直近の tune() 呼び出しで取得できた信号品質統計 (collect_signal_stats=False の場合、または取得に失敗した場合は None)
         self.last_signal_stats: CATVSignalStats | None = None
-
-    @property
-    def last_tuner_opening_failed(self) -> bool:
-        return self._last_tuner_opening_failed
 
     @property
     def name(self) -> str:
@@ -139,7 +175,6 @@ class CATVTuner:
         if physical_channel not in CATV_FREQUENCY_TABLE:
             raise TunerTuningError(f'Unknown physical channel: {physical_channel}')
 
-        self._last_tuner_opening_failed = False
         self.last_signal_stats = None
         conf_file_path = CATVTuner._getConfFilePath()
 
@@ -157,7 +192,6 @@ class CATVTuner:
         try:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except FileNotFoundError as ex:
-            self._last_tuner_opening_failed = True
             raise TunerOpeningError('dvbv5-zap command not found.') from ex
 
         # それぞれ別スレッドで標準出力と標準エラー出力の読み込みを開始
@@ -175,16 +209,18 @@ class CATVTuner:
                     break
                 stdout.extend(data)
 
-        stderr: bytes = b''
+        stderr: bytearray = bytearray()
 
         def stderr_thread_func():
             nonlocal stderr
             assert process.stderr is not None
             while True:
-                data = process.stderr.read(1)
+                # read1() はブロックせずに読み出せる分だけ返すため、ログのリアルタイム出力を保ちつつ
+                # 1バイトずつの read() よりもシステムコール回数とバッファ再確保を減らせる
+                data = process.stderr.read1(4096)
                 if len(data) == 0:
                     break
-                stderr += data
+                stderr.extend(data)
                 if self.output_recisdb_log is True:
                     sys.stderr.buffer.write(data)
                     sys.stderr.buffer.flush()
@@ -318,36 +354,12 @@ class CATVTuner:
         オープン済みのフロントエンド fd に対して ioctl (FE_GET_PROPERTY) を1プロパティ (num=1) だけ実行し、
         u (union) 部分の生バイト列 (先頭32バイト) を返す (ioctl 自体が失敗した場合は None)
 
-        ここで使う ctypes 構造体は、既存 _enumDeliverySystems() の DtvProperty/DtvProperties とまったく同じ
-        'buffer' アーム (data: uint8[32] / len / reserved1 / reserved2) を持つ union で、Linux Kernel の
-        struct dtv_property の union を模したもの。DTV_STAT_* コマンドに対しては本来 dtv_fe_stats
-        (len: uint8 + stat[4] の各9バイト = 37バイト) が書き込まれるが、union は同一メモリ領域を指すため、
-        'buffer.data' (32バイト) を通じてそのまま生バイト列として読み出せる (グローバル値である stat[0] は
-        先頭10バイトに収まるため、32バイトあれば必要十分)。パース処理自体は _parseDtvFeStats() に分離しており、
-        実機のない環境でも合成バイト列でテストできる
+        モジュールレベルの DtvProperty/DtvProperties は Linux Kernel の struct dtv_property の union を模したもので、
+        DTV_STAT_* コマンドに対しては本来 dtv_fe_stats (len: uint8 + stat[4] の各9バイト = 37バイト) が書き込まれるが、
+        union は同一メモリ領域を指すため、'buffer.data' (32バイト) を通じてそのまま生バイト列として読み出せる
+        (グローバル値である stat[0] は先頭10バイトに収まるため、32バイトあれば必要十分)。
+        パース処理自体は _parseDtvFeStats() に分離しており、実機のない環境でも合成バイト列でテストできる
         """
-
-        class DtvProperty(ctypes.Structure):
-            class _u(ctypes.Union):
-                class _buffer(ctypes.Structure):
-                    _fields_ = [
-                        ('data', ctypes.c_uint8 * 32),
-                        ('len', ctypes.c_uint32),
-                        ('reserved1', ctypes.c_uint32 * 3),
-                        ('reserved2', ctypes.c_void_p),
-                    ]
-
-                _fields_ = [('data', ctypes.c_uint32), ('buffer', _buffer)]
-
-            _fields_ = [
-                ('cmd', ctypes.c_uint32),
-                ('reserved', ctypes.c_uint32 * 3),
-                ('u', _u),
-                ('result', ctypes.c_int),
-            ]
-
-        class DtvProperties(ctypes.Structure):
-            _fields_ = [('num', ctypes.c_uint32), ('props', ctypes.POINTER(DtvProperty))]
 
         try:
             dtv_prop = DtvProperty(cmd=cmd)
@@ -414,11 +426,7 @@ class CATVTuner:
 
         lines: list[str] = []
         for channel_name, frequency in CATV_FREQUENCY_TABLE.items():
-            lines.append(f'[{channel_name}]')
-            lines.append(f'\tDELIVERY_SYSTEM = {CATV_DELIVERY_SYSTEM}')
-            lines.append(f'\tFREQUENCY = {frequency}')
-            lines.append(f'\tSYMBOL_RATE = {CATV_SYMBOL_RATE}')
-            lines.append(f'\tMODULATION = {CATV_MODULATION}')
+            lines.extend(BuildDvbv5ConfEntryLines(channel_name, frequency))
 
         fd, path_str = tempfile.mkstemp(prefix='isdb_scanner_catv_', suffix='.conf')
         conf_file_path = Path(path_str)
@@ -481,23 +489,6 @@ class CATVTuner:
     def _getFrontendDeviceName(device_path: Path) -> str | None:
         """DVBv5 ioctl API (FE_GET_INFO) からフロントエンドデバイスの名前を取得する (取得できなければ None)"""
 
-        FE_GET_INFO = 0x80A86F3D
-
-        class DvbFrontendInfo(ctypes.Structure):
-            _fields_ = [
-                ('name', ctypes.c_char * 128),
-                ('type', ctypes.c_uint),
-                ('frequency_min', ctypes.c_uint32),
-                ('frequency_max', ctypes.c_uint32),
-                ('frequency_stepsize', ctypes.c_uint32),
-                ('frequency_tolerance', ctypes.c_uint32),
-                ('symbol_rate_min', ctypes.c_uint32),
-                ('symbol_rate_max', ctypes.c_uint32),
-                ('symbol_rate_tolerance', ctypes.c_uint32),
-                ('notifier_delay', ctypes.c_uint32),
-                ('caps', ctypes.c_uint),
-            ]
-
         try:
             with open(device_path, 'rb', buffering=0) as fe_fd:
                 fe_info = DvbFrontendInfo()
@@ -511,31 +502,6 @@ class CATVTuner:
     @staticmethod
     def _enumDeliverySystems(device_path: Path) -> list[int] | None:
         """DVBv5 ioctl API (DTV_ENUM_DELSYS) からフロントエンドデバイスが対応する配信システムの一覧を取得する (取得できなければ None)"""
-
-        FE_GET_PROPERTY = 0x80106F53
-        DTV_ENUM_DELSYS = 44
-
-        class DtvProperty(ctypes.Structure):
-            class _u(ctypes.Union):
-                class _buffer(ctypes.Structure):
-                    _fields_ = [
-                        ('data', ctypes.c_uint8 * 32),
-                        ('len', ctypes.c_uint32),
-                        ('reserved1', ctypes.c_uint32 * 3),
-                        ('reserved2', ctypes.c_void_p),
-                    ]
-
-                _fields_ = [('data', ctypes.c_uint32), ('buffer', _buffer)]
-
-            _fields_ = [
-                ('cmd', ctypes.c_uint32),
-                ('reserved', ctypes.c_uint32 * 3),
-                ('u', _u),
-                ('result', ctypes.c_int),
-            ]
-
-        class DtvProperties(ctypes.Structure):
-            _fields_ = [('num', ctypes.c_uint32), ('props', ctypes.POINTER(DtvProperty))]
 
         try:
             with open(device_path, 'rb', buffering=0) as fe_fd:

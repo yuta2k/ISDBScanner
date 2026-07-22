@@ -312,6 +312,21 @@ CATV_FREQUENCY_TABLE: dict[str, int] = {
 }
 
 
+def BuildDvbv5ConfEntryLines(physical_channel: str, frequency: int) -> list[str]:
+    """
+    dvbv5 形式 conf ファイルの1チャンネル分のエントリ行を組み立てる
+    (CATVTuner の内部 conf 生成と CATVDvbv5ConfFormatter の出力で共用し、書式が二重管理にならないようにする)
+    """
+
+    return [
+        f'[{physical_channel}]',
+        f'\tDELIVERY_SYSTEM = {CATV_DELIVERY_SYSTEM}',
+        f'\tFREQUENCY = {frequency}',
+        f'\tSYMBOL_RATE = {CATV_SYMBOL_RATE}',
+        f'\tMODULATION = {CATV_MODULATION}',
+    ]
+
+
 class ChannelSummaryInfo(BaseModel):
     """スキャン差分レポートで、丸ごと追加/削除された物理チャンネル1件分の要約情報"""
 

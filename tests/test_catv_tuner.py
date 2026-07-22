@@ -133,7 +133,6 @@ class TestCATVTunerTune:
         tuner = CATVTuner(0)
         data = tuner.tune('CATV_20', recording_time=1.0, tune_timeout=5.0)
         assert len(data) == TS_PACKET_SIZE * 4000
-        assert tuner.last_tuner_opening_failed is False
 
     def test_tune_timeout_raises_tuner_tuning_error(self, fake_dvbv5_zap: Path):
         tuner = CATVTuner(0)
