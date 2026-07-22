@@ -86,8 +86,21 @@ class TestExtractMMTPSequenceNumbers:
         packets = BuildMMTPCompressedIPPacket(0xF110, 7)
         ts_stream = BuildTLVCells(packets)
 
-        assert _ExtractMMTPSequenceNumbers(ts_stream, packet_id=0xF110) == {7}
-        assert _ExtractMMTPSequenceNumbers(ts_stream, packet_id=MMTP_VIDEO_PACKET_ID) == set()
+        assert _ExtractMMTPSequenceNumbers(ts_stream, packet_ids={0xF110}) == {7}
+        assert _ExtractMMTPSequenceNumbers(ts_stream, packet_ids={MMTP_VIDEO_PACKET_ID}) == set()
+
+    def test_packet_ids_resolved_from_mpt_when_omitted(self):
+        # MPT (hev1 アセット) が取得できる場合は、フォールバック値 (MMTP_VIDEO_PACKET_ID) ではなく
+        # MPT から解決した packet_id の MMTP パケットが対象になる
+        from tests.test_mmt import BuildAssetEntry, BuildMPTTable, BuildSignallingTLVPacket
+
+        video_asset = BuildAssetEntry(b'hev1', location_type=0x00, location_body=(0xF200).to_bytes(2, 'big'))
+        mpt_packet = BuildSignallingTLVPacket(packet_id=0x0000, message_body=BuildMPTTable(package_id=0x01, assets=[video_asset]))
+        video_packets = BuildMMTPCompressedIPPacket(0xF200, 10) + BuildMMTPCompressedIPPacket(0xF200, 11)
+        fallback_packets = BuildMMTPCompressedIPPacket(MMTP_VIDEO_PACKET_ID, 999)
+        ts_stream = BuildTLVCells(mpt_packet + video_packets + fallback_packets)
+
+        assert _ExtractMMTPSequenceNumbers(ts_stream) == {10, 11}
 
     def test_no_tlv_data_returns_empty_set(self):
         non_tlv_packet = bytearray(TS_PACKET_SIZE)
@@ -119,22 +132,35 @@ class TestAssignTuners:
 
     def test_explicit_adapters_assignment(self):
         assignments = _AssignTuners(['CATV_C32', 'CATV_C33', 'CATV_C34'], [0, 1, 2])
-        assert assignments == [('CATV_C32', 0), ('CATV_C33', 1), ('CATV_C34', 2)]
+        assert assignments == [('CATV_C32', 0, 0), ('CATV_C33', 1, 0), ('CATV_C34', 2, 0)]
 
     def test_explicit_adapters_more_than_channels_uses_only_needed_count(self):
         assignments = _AssignTuners(['CATV_15'], [3, 4, 5])
-        assert assignments == [('CATV_15', 3)]
+        assert assignments == [('CATV_15', 3, 0)]
 
     def test_too_many_channels_for_explicit_adapters_raises(self):
         with pytest.raises(ValueError):
             _AssignTuners(['CATV_C32', 'CATV_C33', 'CATV_C34'], [0, 1])
+
+    def test_duplicate_explicit_adapters_raises(self):
+        # 同一アダプタへの重複割当は選局が競合するため、収録開始前にエラーにする
+        with pytest.raises(ValueError):
+            _AssignTuners(['CATV_C32', 'CATV_C33'], [1, 1])
 
     def test_auto_detect_uses_available_tuners(self, monkeypatch: pytest.MonkeyPatch):
         fake_tuners = [CATVTuner(2), CATVTuner(5)]
         monkeypatch.setattr(CATVTuner, 'getAvailableCATVTuners', lambda: fake_tuners)
 
         assignments = _AssignTuners(['CATV_15', 'CATV_16'], None)
-        assert assignments == [('CATV_15', 2), ('CATV_16', 5)]
+        assert assignments == [('CATV_15', 2, 0), ('CATV_16', 5, 0)]
+
+    def test_auto_detect_preserves_frontend_number(self, monkeypatch: pytest.MonkeyPatch):
+        # frontend0 以外の CATV 対応フロントエンドが検出された場合、その番号がそのまま割り当てられる
+        fake_tuners = [CATVTuner(0, 1), CATVTuner(3, 2)]
+        monkeypatch.setattr(CATVTuner, 'getAvailableCATVTuners', lambda: fake_tuners)
+
+        assignments = _AssignTuners(['CATV_15', 'CATV_16'], None)
+        assert assignments == [('CATV_15', 0, 1), ('CATV_16', 3, 2)]
 
     def test_auto_detect_no_tuners_raises(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(CATVTuner, 'getAvailableCATVTuners', lambda: [])

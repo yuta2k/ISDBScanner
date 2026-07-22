@@ -205,16 +205,22 @@ def main(
             previous_scan_result = None
 
         if previous_scan_result is not None:
-            current_scan_result = {carrier.physical_channel: carrier.model_dump(mode='json') for carrier in carriers}
-            diff = CompareScanResults(previous_scan_result, current_scan_result)
-            diff_report = FormatScanDiff(diff)
-
-            print(Rule(characters='-', style=Style(color='#E33157')))
-            print('[bright_blue]Scan Diff Report (compared to the previous CATV.json)[/bright_blue]')
-            # レポート自体は rich マークアップなしのプレーンテキストだが、サービス名などに "[" を含む値が
-            # 混ざっていても rich がマークアップとして誤解釈しないよう escape() を通してから表示する
-            print(escape(diff_report))
-            (output_dir / 'CATV.diff.txt').write_text(diff_report, encoding='utf-8')
+            # 前回の CATV.json が古いスキーマや手編集で壊れていても、スキャン結果本体の保存 (この後の save() 群) を
+            # 巻き添えにしないよう、差分レポートの生成・出力はまとめて try/except で保護する
+            try:
+                current_scan_result = {carrier.physical_channel: carrier.model_dump(mode='json') for carrier in carriers}
+                diff = CompareScanResults(previous_scan_result, current_scan_result)
+                diff_report = FormatScanDiff(diff)
+            except Exception as ex:
+                print(f'[yellow]Failed to generate the scan diff report: {type(ex).__name__}: {ex}[/yellow]')
+                print('[yellow]The previous CATV.json may be corrupted or in an old format. Skipping the diff report.[/yellow]')
+            else:
+                print(Rule(characters='-', style=Style(color='#E33157')))
+                print('[bright_blue]Scan Diff Report (compared to the previous CATV.json)[/bright_blue]')
+                # レポート自体は rich マークアップなしのプレーンテキストだが、サービス名などに "[" を含む値が
+                # 混ざっていても rich がマークアップとして誤解釈しないよう escape() を通してから表示する
+                print(escape(diff_report))
+                (output_dir / 'CATV.diff.txt').write_text(diff_report, encoding='utf-8')
 
     CATVJSONFormatter(catv_json_path, carriers).save()
     CATVDvbv5ConfFormatter(output_dir / 'dvbv5_channels_catv.conf', carriers).save()

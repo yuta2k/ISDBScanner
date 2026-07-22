@@ -23,7 +23,13 @@ from rich.style import Style
 from rich.table import Table
 
 from isdb_scanner.catv.constants import CATV_FREQUENCY_TABLE, CarrierType
-from isdb_scanner.catv.mmt import TLV_PACKET_TYPE_COMPRESSED_IP, ExtractTLVStream, _IterTLVPackets, _ParseCompressedIPPacket
+from isdb_scanner.catv.mmt import (
+    TLV_PACKET_TYPE_COMPRESSED_IP,
+    ExtractTLVStream,
+    MMTAnalyzer,
+    _IterTLVPackets,
+    _ParseCompressedIPPacket,
+)
 from isdb_scanner.catv.tsmf import TSMFDemultiplexer
 from isdb_scanner.catv.tuner import CATVTuner
 from isdb_scanner.tuner import TunerOpeningError, TunerOutputError, TunerTuningError
@@ -31,9 +37,14 @@ from isdb_scanner.tuner import TunerOpeningError, TunerOutputError, TunerTuningE
 
 app = typer.Typer()
 
-# 8K マルチキャリア分散伝送の主映像アセットで実データ上使われていることを確認済みの MMTP packet_id
-# (ARIB STD-B60 上正式に予約された値ではなく、実データからの経験則によるフィルタ値)
+# MPT から映像アセットの packet_id を解決できなかった場合のフォールバック値
+# (8K マルチキャリア分散伝送の主映像アセットで実データ上使われていることを確認済みの MMTP packet_id。
+#  ARIB STD-B60 上正式に予約された値ではなく事業者側の割当次第で変わり得るため、
+#  原則は MPT の hev1 アセットから解決した packet_id を使い、これはあくまで最後の砦とする)
 MMTP_VIDEO_PACKET_ID = 0xF100
+
+# MPT で映像 (HEVC) アセットを示す asset_type の FourCC
+_VIDEO_ASSET_TYPE = 'hev1'
 
 
 @dataclass
@@ -42,6 +53,7 @@ class CaptureResult:
 
     physical_channel: str
     adapter_number: int
+    frontend_number: int = 0
     output_path: Path | None = None
     byte_size: int = 0
     carrier_type: CarrierType | None = None
@@ -49,22 +61,45 @@ class CaptureResult:
     error: str | None = None
 
 
-def _ExtractMMTPSequenceNumbers(ts_stream: bytes, packet_id: int = MMTP_VIDEO_PACKET_ID) -> set[int]:
+def _ResolveVideoPacketIDs(tlv_stream: bytes, truncated_packets: list[bytes]) -> set[int]:
     """
-    TLV キャリアの受信データから、指定した packet_id の MMTP パケットの packet_sequence_number 集合を取り出す
+    MPT (MMT Package Table) を解析し、映像 (hev1) アセットに割り当てられている MMTP packet_id の集合を解決する
+    MPT から1つも解決できなかった場合のみ、経験則によるフォールバック値 (MMTP_VIDEO_PACKET_ID) を使う
+    (映像アセットの packet_id は事業者側の割当次第で変わり得るため、MPT を唯一の正としつつ、
+     8K キャリアで MPT が全く取得できなかった場合でも従来通りの判定を続けられるようにしている)
+    """
+
+    mmt_info = MMTAnalyzer().analyze(tlv_stream, truncated_packets)
+    packet_ids = {
+        asset.packet_id
+        for service in mmt_info.services
+        for asset in service.assets
+        if asset.asset_type == _VIDEO_ASSET_TYPE and asset.packet_id is not None
+    }
+    return packet_ids if len(packet_ids) > 0 else {MMTP_VIDEO_PACKET_ID}
+
+
+def _ExtractMMTPSequenceNumbers(ts_stream: bytes, packet_ids: set[int] | None = None) -> set[int]:
+    """
+    TLV キャリアの受信データから、対象 packet_id の MMTP パケットの packet_sequence_number 集合を取り出す
     複数キャリアで同時収録した場合、この値の範囲がキャリア間で重複していれば、同じ時間帯に受信できたデータであり
     8K 合成 (マルチキャリア分散伝送の再結合) に使える可能性が高いと判断できる
     (packet_sequence_number は単調増加するため、時間軸の代わりに使えるという考え方に基づく)
 
     Args:
         ts_stream (bytes): TLV キャリアの受信データ (188 バイト境界に整列済みの TS ストリーム)
-        packet_id (int, optional): 対象の MMTP packet_id. Defaults to MMTP_VIDEO_PACKET_ID.
+        packet_ids (set[int] | None, optional): 対象の MMTP packet_id の集合。
+            省略時は MPT から映像 (hev1) アセットの packet_id を解決する (解決できなければ MMTP_VIDEO_PACKET_ID)。
 
     Returns:
         set[int]: 見つかった packet_sequence_number の集合 (TLV データが無い/対象の packet_id が無ければ空集合)
     """
 
-    tlv_stream = ExtractTLVStream(ts_stream)
+    truncated_packets: list[bytes] = []
+    tlv_stream = ExtractTLVStream(ts_stream, truncated_packets)
+    if packet_ids is None:
+        packet_ids = _ResolveVideoPacketIDs(tlv_stream, truncated_packets)
+
     sequence_numbers: set[int] = set()
     for packet_type, payload in _IterTLVPackets(tlv_stream):
         if packet_type != TLV_PACKET_TYPE_COMPRESSED_IP:
@@ -73,7 +108,7 @@ def _ExtractMMTPSequenceNumbers(ts_stream: bytes, packet_id: int = MMTP_VIDEO_PA
         if parsed is None:
             continue
         _, mmtp_packet_id, mmtp_bytes = parsed
-        if mmtp_packet_id != packet_id or len(mmtp_bytes) < 12:
+        if mmtp_packet_id not in packet_ids or len(mmtp_bytes) < 12:
             continue
         # packet_sequence_number は MMTP 固定ヘッダのオフセット 8-11 (mmt.py の _ExtractSignallingMessageParts と同じ位置)
         sequence_numbers.add(int.from_bytes(mmtp_bytes[8:12], byteorder='big'))
@@ -100,38 +135,48 @@ def _SequenceRangesOverlap(ranges: list[tuple[int, int]]) -> bool:
     return highest_low <= lowest_high
 
 
-def _AssignTuners(channels: list[str], adapters: list[int] | None) -> list[tuple[str, int]]:
+def _AssignTuners(channels: list[str], adapters: list[int] | None) -> list[tuple[str, int, int]]:
     """
-    収録対象チャンネルにチューナー (DVB アダプタ番号) を1台ずつ割り当てる
-    --adapters が明示的に指定されていればその番号をそのまま使い、省略時は検出済みの CATV 対応チューナーを
-    adapter_number の若い順に自動割当する。チャンネル数がチューナー数を超える場合は ValueError を送出する
+    収録対象チャンネルにチューナー (DVB アダプタ/フロントエンド番号) を1台ずつ割り当てる
+    --adapters が明示的に指定されていればその番号をそのまま使い (フロントエンドは 0 固定)、省略時は検出済みの
+    CATV 対応チューナーをデバイスパスの若い順に自動割当する。チャンネル数がチューナー数を超える場合は ValueError を送出する
 
     Args:
         channels (list[str]): 収録対象の物理チャンネル名のリスト (順序を保つ)
         adapters (list[int] | None): 明示的に指定された DVB アダプタ番号のリスト (省略時は自動検出する)
 
     Returns:
-        list[tuple[str, int]]: (物理チャンネル名, アダプタ番号) のリスト (channels と同じ順序)
+        list[tuple[str, int, int]]: (物理チャンネル名, アダプタ番号, フロントエンド番号) のリスト (channels と同じ順序)
 
     Raises:
-        ValueError: チャンネル数がチューナー (アダプタ) 数を超えている場合
+        ValueError: チャンネル数がチューナー (アダプタ) 数を超えている場合、または --adapters に重複がある場合
     """
 
     if adapters is not None:
-        available_adapters = adapters
+        if len(set(adapters)) != len(adapters):
+            raise ValueError(
+                f'--adapters に重複した DVB アダプタ番号が指定されています ({",".join(str(a) for a in adapters)})。'
+                '同一のチューナーで複数チャンネルを同時に収録することはできません。'
+            )
+        available_tuners = [(adapter, 0) for adapter in adapters]
     else:
-        available_adapters = [tuner.adapter_number for tuner in CATVTuner.getAvailableCATVTuners()]
+        # 自動検出時は frontend0 以外の CATV 対応フロントエンドも正しく割り当てる (adapter 番号だけに縮約しない)
+        available_tuners = [(tuner.adapter_number, tuner.frontend_number) for tuner in CATVTuner.getAvailableCATVTuners()]
 
-    if len(channels) > len(available_adapters):
+    if len(channels) > len(available_tuners):
         raise ValueError(
-            f'収録対象チャンネル数 ({len(channels)}) が利用可能なチューナー数 ({len(available_adapters)}) を超えています。'
+            f'収録対象チャンネル数 ({len(channels)}) が利用可能なチューナー数 ({len(available_tuners)}) を超えています。'
         )
 
-    return list(zip(channels, available_adapters[: len(channels)], strict=False))
+    return [
+        (channel, adapter_number, frontend_number)
+        for channel, (adapter_number, frontend_number) in zip(channels, available_tuners[: len(channels)], strict=False)
+    ]
 
 
 def _CaptureChannel(
     adapter_number: int,
+    frontend_number: int,
     physical_channel: str,
     recording_time: float,
     output_path: Path,
@@ -143,8 +188,10 @@ def _CaptureChannel(
     全チャンネルの収録開始タイミングをできるだけ揃えるため、実際の選局 (tune) 呼び出し直前に start_barrier で同期する
     """
 
-    tuner = CATVTuner(adapter_number, output_recisdb_log=output_dvbv5_zap_log)
-    result = CaptureResult(physical_channel=physical_channel, adapter_number=adapter_number)
+    tuner = CATVTuner(adapter_number, frontend_number, output_recisdb_log=output_dvbv5_zap_log)
+    result = CaptureResult(
+        physical_channel=physical_channel, adapter_number=adapter_number, frontend_number=frontend_number
+    )
 
     # 全ワーカースレッドがここに到達するまで待機し、dvbv5-zap の起動 (延いては収録開始) タイミングを揃える
     start_barrier.wait()
@@ -224,8 +271,8 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f'Capturing {len(assignments)} channel(s) simultaneously for {recording_time:.1f} seconds:')
-    for physical_channel, adapter_number in assignments:
-        print(f'  [green]{physical_channel}[/green] -> adapter{adapter_number}')
+    for physical_channel, adapter_number, frontend_number in assignments:
+        print(f'  [green]{physical_channel}[/green] -> adapter{adapter_number}/frontend{frontend_number}')
     print(Rule(characters='-', style=Style(color='#E33157')))
 
     # 全ワーカースレッドの選局開始タイミングを揃えるためのバリア (全チャンネル分のスレッドが揃うまで待機する)
@@ -236,13 +283,14 @@ def main(
             executor.submit(
                 _CaptureChannel,
                 adapter_number,
+                frontend_number,
                 physical_channel,
                 recording_time,
                 output_dir / f'{physical_channel}.ts',
                 start_barrier,
                 output_dvbv5_zap_log,
             )
-            for physical_channel, adapter_number in assignments
+            for physical_channel, adapter_number, frontend_number in assignments
         ]
         results = [future.result() for future in futures]
 
@@ -263,6 +311,19 @@ def main(
         sequence_str = f'{result.sequence_range[0]}..{result.sequence_range[1]}' if result.sequence_range is not None else '-'
         table.add_row(result.physical_channel, str(result.adapter_number), size_str, carrier_type_str, sequence_str)
     print(table)
+
+    # 映像 MMTP パケットのシーケンス番号が取得できなかった TLV キャリアは重複判定の対象外になるため、その旨を警告しておく
+    # (黙って判定をスキップすると「収録は成功した」ようにしか見えず、使えないデータに気付けない)
+    tlv_results_without_range = [
+        result
+        for result in results
+        if result.error is None and result.carrier_type == CarrierType.TLV and result.sequence_range is None
+    ]
+    for result in tlv_results_without_range:
+        print(
+            f'[yellow]{result.physical_channel}: 映像 MMTP パケットのシーケンス番号を取得できなかったため、'
+            '時間範囲の重複判定から除外します。収録データが 8K 合成に使えるかは別途確認してください。[/yellow]'
+        )
 
     # 複数の TLV キャリアで packet_sequence_number が取得できていれば、時間範囲が重複しているか (=8K 合成可能なデータか) を判定する
     tlv_results_with_range = [
