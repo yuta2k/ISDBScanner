@@ -118,6 +118,9 @@ class CATVTuner:
 
     # 全チャンネル分の dvbv5 conf ファイルは同一プロセス内で使い回すため、初回生成時にクラス変数へキャッシュする
     _conf_file_path: ClassVar[Path | None] = None
+    # 複数チューナーでの並列スキャン/収録では初回の tune() が同時に走るため、conf ファイルの生成をロックで直列化する
+    # (ロックがないと各ワーカーが個別に tempfile を生成してしまい、キャッシュを共有できずに余分な一時ファイルが残る)
+    _conf_file_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, adapter_number: int, frontend_number: int = 0, output_recisdb_log: bool = False) -> None:
         """
@@ -421,20 +424,26 @@ class CATVTuner:
         DELIVERY_SYSTEM / SYMBOL_RATE / MODULATION は ISDB-C 向けの固定値を利用する (constants.py 参照)
         """
 
+        # 並列スキャン/収録では複数ワーカーがほぼ同時に初回生成へ到達するため、ロックで直列化して二重生成を防ぐ
+        # (ダブルチェックロッキング: ロック取得前後の両方でキャッシュの有無を確認し、生成は最初の1回だけに絞る)
         if CATVTuner._conf_file_path is not None and CATVTuner._conf_file_path.is_file():
             return CATVTuner._conf_file_path
 
-        lines: list[str] = []
-        for channel_name, frequency in CATV_FREQUENCY_TABLE.items():
-            lines.extend(BuildDvbv5ConfEntryLines(channel_name, frequency))
+        with CATVTuner._conf_file_lock:
+            if CATVTuner._conf_file_path is not None and CATVTuner._conf_file_path.is_file():
+                return CATVTuner._conf_file_path
 
-        fd, path_str = tempfile.mkstemp(prefix='isdb_scanner_catv_', suffix='.conf')
-        conf_file_path = Path(path_str)
-        with open(fd, mode='w', encoding='utf-8') as f:
-            f.write('\n'.join(lines) + '\n')
+            lines: list[str] = []
+            for channel_name, frequency in CATV_FREQUENCY_TABLE.items():
+                lines.extend(BuildDvbv5ConfEntryLines(channel_name, frequency))
 
-        CATVTuner._conf_file_path = conf_file_path
-        return conf_file_path
+            fd, path_str = tempfile.mkstemp(prefix='isdb_scanner_catv_', suffix='.conf')
+            conf_file_path = Path(path_str)
+            with open(fd, mode='w', encoding='utf-8') as f:
+                f.write('\n'.join(lines) + '\n')
+
+            CATVTuner._conf_file_path = conf_file_path
+            return conf_file_path
 
     @staticmethod
     def getAvailableCATVTuners(output_recisdb_log: bool = False) -> list[CATVTuner]:
