@@ -363,11 +363,13 @@ class MirakurunChannelsYmlFormatter(BaseFormatter):
             else:
                 # recisdb 互換の物理チャンネル指定フォーマット
                 mirakurun_channel = ts_info.physical_channel_recisdb
-                if ts_info.broadcast_type == 'BS':
-                    # BS のみ追加の引数として --tsid (BS チャンネルの TSID) を指定し、当該トランスポンダで送出中の TS を明示的に TSID で選局する
-                    ## 実際に発行されるチューナーコマンドは --channel BS23_2 --tsid 18803 のようになる
-                    ## (--tsid 指定時は物理チャンネル表記に含まれる相対 TS 番号は無視され、常に物理 BS-23ch 内で送出中の TSID が 18803 の TS が選局される)
-                    ## 地上波や CS にはスロットや相対 TS 番号の概念がないため、TSID を指定する必要はない
+                if ts_info.broadcast_type in ('BS', 'CS1', 'CS2'):
+                    # BS・CS では追加の引数として --tsid (当該 TS の TSID) を指定し、当該トランスポンダで送出中の TS を明示的に TSID で選局する
+                    ## 実際に発行されるチューナーコマンドは --channel BS23_2 --tsid 18803 や --channel CS04 --tsid 28736 のようになる
+                    ## (--tsid 指定時は物理チャンネル表記に含まれる相対 TS 番号は無視され、常に当該物理チャンネル内で送出中の TSID が一致する TS が選局される)
+                    ## recisdb の V4L-DVB (DVBv5) 経路では ISDB-S のロックに TSID (DTV_STREAM_ID) の指定が必須で、
+                    ## BS は recisdb 内蔵の相対 TS テーブルで TSID を自動補完できるが、CS は補完テーブルが無いため --tsid の明示指定が必須
+                    ## (地上波にはスロット/相対 TS 番号の概念が無いため TSID の指定は不要)
                     extra_args = f' --tsid {ts_info.transport_stream_id} '  # 意図的に先頭と末尾に半角スペースを入れている
                 else:
                     # Mirakurun のプレースホルダーは単なる文字列置換で実装されているが、"satellite" が空だと条件分岐が成立せず
@@ -652,11 +654,13 @@ class MirakcConfigYmlFormatter(BaseFormatter):
             else:
                 # recisdb 互換の物理チャンネル指定フォーマット
                 mirakc_channel = ts_info.physical_channel_recisdb
-                ## BS のみ追加の引数として --tsid (BS チャンネルの TSID) を指定し、当該トランスポンダで送出中の TS を明示的に TSID で選局する
-                ## 実際に発行されるチューナーコマンドは --channel BS23_2 --tsid 18803 のようになる
-                ## (--tsid 指定時は物理チャンネル表記に含まれる相対 TS 番号は無視され、常に物理 BS-23ch 内で送出中の TSID が 18803 の TS が選局される)
-                ## 地上波や CS にはスロットや相対 TS 番号の概念がないため、TSID を指定する必要はない
-                if ts_info.broadcast_type == 'BS':
+                ## BS・CS では追加の引数として --tsid (当該 TS の TSID) を指定し、当該トランスポンダで送出中の TS を明示的に TSID で選局する
+                ## 実際に発行されるチューナーコマンドは --channel BS23_2 --tsid 18803 や --channel CS04 --tsid 28736 のようになる
+                ## (--tsid 指定時は物理チャンネル表記に含まれる相対 TS 番号は無視され、常に当該物理チャンネル内で送出中の TSID が一致する TS が選局される)
+                ## recisdb の V4L-DVB (DVBv5) 経路では ISDB-S のロックに TSID (DTV_STREAM_ID) の指定が必須で、
+                ## BS は recisdb 内蔵の相対 TS テーブルで TSID を自動補完できるが、CS は補完テーブルが無いため --tsid の明示指定が必須
+                ## (地上波にはスロット/相対 TS 番号の概念が無いため TSID の指定は不要)
+                if ts_info.broadcast_type in ('BS', 'CS1', 'CS2'):
                     extra_args = f'--tsid {ts_info.transport_stream_id}'
                 else:
                     # channel.extra-args のデフォルト値は空文字列なので、extra-args 自体の指定を省略しているのと同じ
