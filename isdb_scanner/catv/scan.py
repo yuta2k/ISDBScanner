@@ -156,6 +156,16 @@ def _ScanWorker(
                     f'required_card={ts_info.cas.required_card} | services={len(ts_info.services)}'
                 )
 
+            # TLV (4K/8K MMT) キャリアは transport_streams を持たないため、MMT サービス (MPT/MH-SDT) の情報を表示する
+            if carrier_info.mmt is not None:
+                for mmt_service in carrier_info.mmt.services:
+                    print(
+                        f'[green]MMT Service[/green]: package_id={mmt_service.package_id:#06x} | '
+                        f'{mmt_service.service_name} | assets={len(mmt_service.assets)}'
+                    )
+                if len(carrier_info.mmt.sdt_services) > 0:
+                    print(f'[green]MH-SDT Services[/green]: {len(carrier_info.mmt.sdt_services)} services in this network')
+
             # 信号品質統計はドライバによって取得できる項目が異なる (dB系/%系のどちらか一方だけのことが多い) ため、
             # 実際に値が取れた項目だけを表示する
             if carrier_info.signal_stats is not None:

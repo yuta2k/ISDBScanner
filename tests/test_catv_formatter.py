@@ -8,8 +8,10 @@ from isdb_scanner.catv.constants import (
     CarrierType,
     CASInfo,
     CATVCarrierInfo,
+    CATVMMTInfo,
     CATVServiceInfo,
     CATVTransportStreamInfo,
+    MMTServiceInfo,
     PreferredSource,
 )
 from isdb_scanner.catv.formatter import (
@@ -145,7 +147,13 @@ def BuildSyntheticCarriers() -> list[CATVCarrierInfo]:
             ),
         ],
     )
-    tlv_carrier = CATVCarrierInfo(physical_channel='CATV_C36', carrier_type=CarrierType.TLV, transport_streams=[])
+    tlv_carrier = CATVCarrierInfo(
+        physical_channel='CATV_C36',
+        carrier_type=CarrierType.TLV,
+        transport_streams=[],
+        # MH-SDT からサービス名を取得できているケース (除外注記のコメント行に併記される)
+        mmt=CATVMMTInfo(services=[MMTServiceInfo(package_id=0x65, service_id=0x65, service_name='テスト４Ｋ')]),
+    )
     empty_carrier = CATVCarrierInfo(physical_channel='CATV_C62', carrier_type=CarrierType.Empty, transport_streams=[])
 
     return [tsmf_carrier, single_ts_carrier, tlv_carrier, empty_carrier]
@@ -202,6 +210,8 @@ class TestCATVMirakurunChannelsYmlFormatterSynthetic:
 
         assert all(channel['channel'] != 'CATV_C36' for channel in channels)
         assert 'CATV_C36' in formatted_str  # 除外した旨のコメント行に含まれている
+        # MH-SDT 由来のサービス名が取得できていれば、どのチャンネルかを特定しやすいよう併記される
+        assert '#   CATV_C36: テスト４Ｋ' in formatted_str
 
     def test_header_mentions_dvbv5_zap_tuner_command(self):
         carriers = BuildSyntheticCarriers()

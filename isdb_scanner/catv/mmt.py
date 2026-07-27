@@ -7,6 +7,7 @@ from isdb_scanner.catv.constants import (
     CATVMMTInfo,
     MMTAssetInfo,
     MMTExternalReferenceInfo,
+    MMTSDTServiceInfo,
     MMTServiceInfo,
     TLVCarrierGroupInfo,
     TLVNetworkInfo,
@@ -44,6 +45,24 @@ _FREQUENCY_LIST_ENTRY_LENGTH = 12
 
 # MPT (MMT Package Table) の table_id
 MMT_TABLE_ID_MPT = 0x20
+
+# MH-SDT が伝送される MMTP パケットの packet_id (ARIB STD-B60 表4-12 でシグナリング用に固定割り当てされている)
+MMT_SI_PACKET_ID_MH_SDT = 0x8004
+
+# M2 セクションメッセージの message_id (ARIB STD-B60 表6-4)
+# MH-SDT を含む MMT-SI のセクション形式テーブルは、このメッセージに 1 セクションずつ格納されて伝送される
+# (message_id ごとに length フィールドの幅が固定されており、M2 セクションメッセージでは 16bit)
+MMT_MESSAGE_ID_M2_SECTION = 0x8000
+
+# MH-SDT (ARIB STD-B60 表7-23) の table_id
+MH_SDT_TABLE_ID_ACTUAL = 0x9F  # 自ストリーム (このキャリアで伝送されている TLV ストリーム自身のサービス)
+MH_SDT_TABLE_ID_OTHER = 0xA0  # 他ストリーム (同一放送網内の他の TLV ストリームのサービス)
+
+# MH-サービス記述子のタグ値 (ARIB STD-B60 表7-69)
+# MMT-SI の記述子タグは MPEG-2 PSI/SI と異なり 16bit であることに注意
+# 本体は service_type(8) + service_provider_name_length(8) + service_provider_name + service_name_length(8) + service_name で、
+# 文字符号は BOM 無し UTF-8 (STD-B60 7.2.2。地上波/BS の SDT が使う ARIB 8単位符号ではない)
+_MH_SERVICE_DESCRIPTOR_TAG = 0x8019
 
 # ヘッダ圧縮 IP パケットの header_type (実データから確認した値)
 # 0x20/0x21: フルヘッダパケット (コンテキスト確立。IPv6 ヘッダ 40B + UDP ヘッダ 8B を含む)
@@ -561,11 +580,110 @@ def _ScanForMPT(buf: bytes, *, allow_truncated: bool = False) -> Iterator[MMTSer
         index = min(index + 4 + table_length, len(buf))
 
 
+def _ParseMMTSIDescriptors(data: bytes) -> list[tuple[int, bytes]] | None:
+    """
+    MMT-SI の記述子ループを (descriptor_tag, body) のリストに分解する
+    MPEG-2 PSI/SI の記述子と異なり descriptor_tag が 16bit であることに注意 (descriptor_length は tag <= 0xEFFF なら 8bit)
+    宣言長がループ全体とぴったり合わない場合は壊れたデータとみなして None を返す
+    """
+
+    descriptors: list[tuple[int, bytes]] = []
+    offset = 0
+    while offset + 3 <= len(data):
+        descriptor_tag = (data[offset] << 8) | data[offset + 1]
+        descriptor_length = data[offset + 2]
+        body = data[offset + 3 : offset + 3 + descriptor_length]
+        if len(body) != descriptor_length:
+            return None
+        descriptors.append((descriptor_tag, body))
+        offset += 3 + descriptor_length
+    return descriptors if offset == len(data) else None
+
+
+def _ExtractM2Section(message: bytes) -> bytes | None:
+    """
+    シグナリングメッセージ本体から M2 セクションメッセージ (message_id=0x8000) のセクション部分を取り出す
+    構造は message_id(16bit) + version(8bit) + length(16bit) + セクション1個 で、length は残り全バイト数と一致する
+    M2 セクションメッセージでない場合や長さが矛盾する場合は None を返す
+    """
+
+    if len(message) < 5 or int.from_bytes(message[0:2], byteorder='big') != MMT_MESSAGE_ID_M2_SECTION:
+        return None
+    length = int.from_bytes(message[3:5], byteorder='big')
+    section = message[5 : 5 + length]
+    if len(section) != length:
+        return None
+    return section
+
+
+def _ParseMHSDT(section: bytes) -> list[MMTSDTServiceInfo] | None:
+    """
+    MH-SDT セクション (ARIB STD-B60 表7-23) を解析し、記載されているサービスの一覧を返す
+    セクション構造は MPEG-2 の SDT とほぼ同じ (transport_stream_id が tlv_stream_id に置き換わっている) で、
+    末尾の CRC_32 も MPEG-2 PSI と同一のため、既存の _VerifySectionCRC32 でそのまま検証できる
+    サービス名は記述子ループ内の MH-サービス記述子 (tag=0x8019) から取得する
+
+    table_id が MH-SDT でない場合や、宣言長の矛盾・CRC32 不一致があった場合は None を返す
+    """
+
+    if len(section) < 16 or section[0] not in (MH_SDT_TABLE_ID_ACTUAL, MH_SDT_TABLE_ID_OTHER):
+        return None
+    section_length = (((section[1] & 0x0F) << 8) | section[2]) + 3
+    if section_length != len(section) or not _VerifySectionCRC32(section):
+        return None
+
+    on_current_stream = section[0] == MH_SDT_TABLE_ID_ACTUAL
+    services: list[MMTSDTServiceInfo] = []
+    # 0-2: table_id/section_length, 3-4: tlv_stream_id, 5: version_number 等, 6: section_number, 7: last_section_number,
+    # 8-9: original_network_id, 10: reserved_future_use → 11 からサービスループが始まる
+    offset = 11
+    loop_end = len(section) - 4  # 末尾4バイトは CRC_32
+    while offset + 5 <= loop_end:
+        service_id = (section[offset] << 8) | section[offset + 1]
+        # offset + 2: reserved_future_use(3bit) + EIT フラグ群(5bit) (現時点では未使用)
+        running_status = (section[offset + 3] >> 5) & 0x07
+        free_ca_mode = (section[offset + 3] >> 4) & 0x01
+        descriptors_loop_length = ((section[offset + 3] & 0x0F) << 8) | section[offset + 4]
+        offset += 5
+        descriptors_bytes = section[offset : offset + descriptors_loop_length]
+        if len(descriptors_bytes) != descriptors_loop_length:
+            return None
+        offset += descriptors_loop_length
+
+        service_info = MMTSDTServiceInfo(
+            service_id=service_id,
+            is_free=not free_ca_mode,
+            running_status=running_status,
+            on_current_stream=on_current_stream,
+        )
+        for descriptor_tag, body in _ParseMMTSIDescriptors(descriptors_bytes) or []:
+            if descriptor_tag != _MH_SERVICE_DESCRIPTOR_TAG or len(body) < 2:
+                continue
+            service_info.service_type = body[0]
+            position = 1
+            provider_name_length = body[position]
+            position += 1
+            service_info.service_provider_name = body[position : position + provider_name_length].decode('utf-8', errors='replace')
+            position += provider_name_length
+            if position < len(body):
+                service_name_length = body[position]
+                position += 1
+                service_info.service_name = body[position : position + service_name_length].decode('utf-8', errors='replace')
+        services.append(service_info)
+
+    return services
+
+
 def _ExtractSignallingMessageParts(payload: bytes) -> tuple[int, int, int, bool, bool, bytes] | None:
     """
     ヘッダ圧縮 IP パケット (TLV type=0x03) のペイロードからシグナリングメッセージの構成要素を取り出す
     戻り値: (packet_id, packet_sequence_number, fragmentation_indicator, length_extension_flag, aggregation_flag, body)
     シグナリングメッセージでない場合や解析できない場合は None を返す
+
+    シグナリングメッセージのペイロードヘッダ (ARIB STD-B60 表6-3) は 2 バイト固定:
+      1バイト目: fragmentation_indicator(2bit) + reserved(4bit) + length_extension_flag(1bit) + aggregation_flag(1bit)
+      2バイト目: fragment_counter(8bit)
+    body はこの 2 バイトを除いたメッセージ本体 (分割されている場合はその断片) になる
     """
 
     parsed = _ParseCompressedIPPacket(payload)
@@ -576,7 +694,7 @@ def _ExtractSignallingMessageParts(payload: bytes) -> tuple[int, int, int, bool,
         return None
 
     payload_offset = _MMTPPayloadOffset(mmtp_bytes)
-    if payload_offset is None or payload_offset >= len(mmtp_bytes):
+    if payload_offset is None or payload_offset + 2 > len(mmtp_bytes):
         return None
     # packet_sequence_number は MMTP 固定ヘッダのオフセット 8-11 (fragmentation 再組み立て時の連続性チェックに使う)
     packet_sequence_number = int.from_bytes(mmtp_bytes[8:12], byteorder='big')
@@ -586,12 +704,13 @@ def _ExtractSignallingMessageParts(payload: bytes) -> tuple[int, int, int, bool,
     fragmentation_indicator = (header_byte >> 6) & 0x3
     length_extension_flag = bool((header_byte >> 1) & 0x1)
     aggregation_flag = bool(header_byte & 0x1)
-    return packet_id, packet_sequence_number, fragmentation_indicator, length_extension_flag, aggregation_flag, signalling_payload[1:]
+    return packet_id, packet_sequence_number, fragmentation_indicator, length_extension_flag, aggregation_flag, signalling_payload[2:]
 
 
 class MMTAnalyzer:
     """
-    TLV ストリーム (ExtractTLVStream の出力) を解析し、TLV-NIT (ネットワーク情報) と MPT (サービス/アセット一覧) を取り出すクラス
+    TLV ストリーム (ExtractTLVStream の出力) を解析し、TLV-NIT (ネットワーク情報)・MPT (サービス/アセット一覧)・
+    MH-SDT (サービス名) を取り出すクラス
 
     8K マルチキャリア分散伝送 (JLabs SPEC-034 相当) の検出は次の3系統で行う (いずれかに該当すれば is_multi_carrier_partial)
       1. TSMF 多重フレームヘッダのキャリアグループ情報 (ExtractTLVCarrierGroupInfo で取得し carrier_group 引数で渡す)
@@ -602,8 +721,14 @@ class MMTAnalyzer:
       3. MPT の location_type=0x03 (別放送網参照) アセット — ARIB STD-B60 上の正規の手段だが、
          手元の 8K キャリア実データでは全アセットが location_type=0x00 でありこの参照は使われていなかった
 
-    MH-SDT (サービス名) の取得は実データの解析を試みたが、外側のメッセージフォーマットを確実に特定できなかったため
-    現時点では非対応とし、service_name は 'Unknown' のままとしている (詳細は README/報告を参照)
+    MH-SDT (サービス名) は、シグナリング用に固定割り当てされた packet_id=0x8004 (ARIB STD-B60 表4-12) の MMTP パケットに
+    M2 セクションメッセージ (message_id=0x8000) として載っているため、この packet_id に絞った専用経路で決め打ち解析している
+    (MPT のように内容をスキャンして探す必要がない)。得られたサービスは次の2通りで使う:
+      - 自ストリーム (table_id=0x9F) の service_id は実データの全キャリアで MPT の package_id と完全に一致するため、
+        これで MPT のサービスにサービス名を紐づける (MPT が取得できなかったサービスも assets 空のエントリとして補完する)
+      - 自ストリーム/他ストリーム (table_id=0xA0) 双方のサービスを sdt_services として放送網全体の一覧に載せる
+    MH-SDT はセクションが小さく、MPT が打ち切りサルベージでしか得られない 8K マルチキャリア分散伝送のキャリアでも
+    完全な形で取得できることが多いため、8K サービスのサービス名を得る最も確実な手段になっている
     """
 
     def analyze(
@@ -628,12 +753,19 @@ class MMTAnalyzer:
 
         network_info: TLVNetworkInfo | None = None
         services_by_package_id: dict[int, MMTServiceInfo] = {}
+        sdt_services_by_service_id: dict[int, MMTSDTServiceInfo] = {}
         external_references: set[tuple[int, int]] = set()
         # MMTP シグナリングメッセージが複数パケットに分割 (fragmentation) されている場合の再組み立てバッファ
         # packet_id ごとに (連結中のバッファ, 直前フラグメントの packet_sequence_number) を保持し、
         # 先頭フラグメント (fragmentation_indicator=1) から最終フラグメント (=3) までを連結する
-        # 実データでは各継続フラグメントの先頭1バイトが fragmentation_counter であることを確認済みなのでこれを除いて連結する
+        # 各フラグメントの先頭2バイトは _ExtractSignallingMessageParts の時点でペイロードヘッダとして除去済み
         fragment_buffers: dict[int, tuple[bytearray, int]] = {}
+
+        def RegisterSDTServiceInfo(sdt_service_info: MMTSDTServiceInfo) -> None:
+            """MH-SDT から解析できたサービスを登録する (自ストリーム (0x9F) の情報を他ストリーム (0xA0) の情報より優先する)"""
+            existing = sdt_services_by_service_id.get(sdt_service_info.service_id)
+            if existing is None or (sdt_service_info.on_current_stream and not existing.on_current_stream):
+                sdt_services_by_service_id[sdt_service_info.service_id] = sdt_service_info
 
         def RegisterServiceInfo(service_info: MMTServiceInfo) -> None:
             """解析できた MPT を登録する (同一 package_id が複数回得られた場合はアセット数が多い方 = より完全な方を採用する)"""
@@ -671,8 +803,8 @@ class MMTAnalyzer:
                 if sequence_number != ((last_sequence_number + 1) & 0xFFFFFFFF):
                     del fragment_buffers[packet_id]
                     continue
-                # 中間 (2) / 最終 (3) フラグメント: 先頭1バイトの fragmentation_counter を除いて連結する
-                buffer += body[1:]
+                # 中間 (2) / 最終 (3) フラグメント
+                buffer += body
                 if fragmentation_indicator == 3:
                     message = bytes(buffer)
                     del fragment_buffers[packet_id]
@@ -689,6 +821,12 @@ class MMTAnalyzer:
                 messages = [message]
 
             for single_message in messages:
+                if packet_id == MMT_SI_PACKET_ID_MH_SDT:
+                    # MH-SDT 専用の packet_id: M2 セクションメッセージとして決め打ちで解析する
+                    section = _ExtractM2Section(single_message)
+                    for sdt_service_info in (_ParseMHSDT(section) if section is not None else None) or []:
+                        RegisterSDTServiceInfo(sdt_service_info)
+                    continue
                 for service_info in _ScanForMPT(single_message):
                     RegisterServiceInfo(service_info)
 
@@ -700,16 +838,32 @@ class MMTAnalyzer:
             parts = _ExtractSignallingMessageParts(truncated_packet[4:])
             if parts is None:
                 continue
-            _, _, fragmentation_indicator, _, _, body = parts
+            packet_id, _, fragmentation_indicator, _, _, body = parts
             # 打ち切られたパケットは末尾が欠けているため、フラグメント再組み立ては不可能 (fragmentation_indicator=0 のみ対象)
-            if fragmentation_indicator != 0:
+            # MH-SDT (packet_id=0x8004) は CRC32 検証が必要で打ち切られたセクションからは解析できないため対象外
+            if fragmentation_indicator != 0 or packet_id == MMT_SI_PACKET_ID_MH_SDT:
                 continue
             for service_info in _ScanForMPT(body, allow_truncated=True):
                 # 打ち切りサルベージの結果は、完全なパケットから解析できた結果より常に劣後する
                 # (RegisterServiceInfo はアセット数の多い方を採用するため、そのまま登録してよい)
                 RegisterServiceInfo(service_info)
 
+        # MH-SDT の自ストリーム (table_id=0x9F) のサービスを MPT のサービスに紐づける
+        # 実データの全キャリアで MPT の package_id と自ストリーム MH-SDT の service_id が完全に一致することを確認済み
+        for sdt_service_info in sdt_services_by_service_id.values():
+            if not sdt_service_info.on_current_stream:
+                continue
+            service_info = services_by_package_id.get(sdt_service_info.service_id)
+            if service_info is None:
+                # MPT が (打ち切りサルベージでも) 取得できなかったサービス: MH-SDT で存在は確認できているため、
+                # アセット一覧が空のエントリとして補完する (8K マルチキャリア分散伝送のキャリアで発生しうる)
+                service_info = MMTServiceInfo(package_id=sdt_service_info.service_id)
+                services_by_package_id[sdt_service_info.service_id] = service_info
+            service_info.service_id = sdt_service_info.service_id
+            service_info.service_name = sdt_service_info.service_name
+
         services = sorted(services_by_package_id.values(), key=lambda service_info: service_info.package_id)
+        sdt_services = sorted(sdt_services_by_service_id.values(), key=lambda sdt_service_info: sdt_service_info.service_id)
         external_reference_infos = [
             MMTExternalReferenceInfo(network_id=network_id, transport_stream_id=transport_stream_id)
             for network_id, transport_stream_id in sorted(external_references)
@@ -744,6 +898,7 @@ class MMTAnalyzer:
         return CATVMMTInfo(
             network=network_info,
             services=services,
+            sdt_services=sdt_services,
             carrier_group=carrier_group,
             is_multi_carrier_partial=is_multi_carrier_partial,
             external_references=external_reference_infos,

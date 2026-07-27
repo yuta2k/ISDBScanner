@@ -105,8 +105,28 @@ class MMTServiceInfo(BaseModel):
 
     # fmt: off
     package_id: int = -1                  # package_id (MPT の package_id をそのまま整数化したもの)
-    service_name: str = 'Unknown'         # サービス名 (MH-SDT などから取得できなかった場合は 'Unknown')
-    assets: list[MMTAssetInfo] = []       # アセット一覧
+    service_id: int | None = None         # サービス ID (自ストリームの MH-SDT で存在を確認できた場合のみ設定。実データでは常に package_id と一致する)
+    service_name: str = 'Unknown'         # サービス名 (MH-SDT から取得できなかった場合は 'Unknown')
+    assets: list[MMTAssetInfo] = []       # アセット一覧 (MPT が取得できず MH-SDT からのみ存在を確認できたサービスでは空になる)
+    # fmt: on
+
+
+class MMTSDTServiceInfo(BaseModel):
+    """
+    MH-SDT (ARIB STD-B60 表7-23) から得られる、放送網内のサービス 1 つ分の情報
+    MH-SDT には自ストリーム (table_id=0x9F) だけでなく他ストリーム (table_id=0xA0) のサービスも記載されるため、
+    1 キャリアの受信データから放送網全体のサービス一覧を取得できることがある
+    (ただし他ストリームのテーブルは 1 つずつ順次送出されるため、短時間の収録では一部しか取得できないことがある)
+    """
+
+    # fmt: off
+    service_id: int = -1                       # サービス ID (自ストリームのサービスでは MPT の package_id と一致する)
+    service_name: str = 'Unknown'              # サービス名 (MH-サービス記述子 tag=0x8019 から取得。BOM 無し UTF-8 で符号化されている)
+    service_provider_name: str = ''            # 事業者名 (MH-サービス記述子から取得。空文字列のことも多い)
+    service_type: int | None = None            # サービス形式種別 (ex: 0x01=デジタルTVサービス。取得できなかった場合は None)
+    is_free: bool = True                       # 無料放送かどうか (MH-SDT の free_CA_mode の否定)
+    running_status: int = 0                    # running_status (0=未定義, 1=非動作中, 4=動作中 など。未サービスイン枠の判別に使える)
+    on_current_stream: bool = False            # このキャリアで伝送されている TLV ストリーム自身のサービスか (table_id=0x9F なら True)
     # fmt: on
 
 
@@ -168,6 +188,10 @@ class CATVMMTInfo(BaseModel):
     # fmt: off
     network: TLVNetworkInfo | None = None                         # TLV-NIT から得られるネットワーク情報 (取得できなかった場合は None)
     services: list[MMTServiceInfo] = []                           # MPT から得られたサービス (4K/8K チャンネル) 一覧
+                                                                   # (MPT が取得できず自ストリームの MH-SDT からのみ存在を確認できたサービスも含む)
+    sdt_services: list[MMTSDTServiceInfo] = []                    # MH-SDT から得られた放送網内のサービス一覧 (service_id 昇順)
+                                                                   # 他ストリーム (table_id=0xA0) のサービスも含むため、このキャリアで
+                                                                   # 受信できるとは限らない (on_current_stream で判別できる)
     carrier_group: TLVCarrierGroupInfo | None = None              # TSMF 多重フレームヘッダから得られる自キャリアの識別・グループ情報
     is_multi_carrier_partial: bool = False                        # 8K 等のマルチキャリア分散伝送の一部 (このキャリア単体では全データが揃わない)
                                                                    # であることを示す。TSMF ヘッダのキャリアグループ情報 (count >= 2)、
@@ -382,6 +406,16 @@ class MMTServiceDiffInfo(BaseModel):
     # fmt: on
 
 
+class MMTSDTServiceDiffInfo(BaseModel):
+    """スキャン差分レポートにおける、追加/削除/改名された MH-SDT 由来のサービス (放送網内のサービス) 1件分の情報"""
+
+    # fmt: off
+    service_id: int = -1                        # MH-SDT の service_id
+    service_name: str = 'Unknown'                # 現在のサービス名 (削除の場合は削除される直前の名前)
+    previous_service_name: str | None = None    # 改名の場合のみ、変更前のサービス名 (追加/削除では None)
+    # fmt: on
+
+
 class CASChangeInfo(BaseModel):
     """スキャン差分レポートにおける、TS 単位の CAS 種別 (required_card) 変化 1件分の情報"""
 
@@ -417,6 +451,9 @@ class ChannelChangeInfo(BaseModel):
     added_mmt_services: list[MMTServiceDiffInfo] = []      # TLV キャリアの MMT サービス (package_id 単位) の増減・改名
     removed_mmt_services: list[MMTServiceDiffInfo] = []
     renamed_mmt_services: list[MMTServiceDiffInfo] = []
+    added_mmt_sdt_services: list[MMTSDTServiceDiffInfo] = []      # MH-SDT 由来のサービス (service_id 単位) の増減・改名
+    removed_mmt_sdt_services: list[MMTSDTServiceDiffInfo] = []
+    renamed_mmt_sdt_services: list[MMTSDTServiceDiffInfo] = []
     cas_changes: list[CASChangeInfo] = []
     retransmission_source_changes: list[RetransmissionSourceChangeInfo] = []
     # fmt: on

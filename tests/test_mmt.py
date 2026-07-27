@@ -1,5 +1,8 @@
 from isdb_scanner.catv.cas import _CalculateCRC32MPEG
 from isdb_scanner.catv.mmt import (
+    MH_SDT_TABLE_ID_ACTUAL,
+    MH_SDT_TABLE_ID_OTHER,
+    MMT_SI_PACKET_ID_MH_SDT,
     TLV_PACKET_TYPE_COMPRESSED_IP,
     TLV_PACKET_TYPE_SIGNALING,
     TLV_SYNC_BYTE,
@@ -78,16 +81,75 @@ def BuildMPTTable(package_id: int, assets: list[bytes]) -> bytes:
     return header + bytes(body)
 
 
-def BuildSignallingTLVPacket(packet_id: int, message_body: bytes) -> bytes:
+def BuildSignallingTLVPacket(
+    packet_id: int,
+    message_body: bytes,
+    *,
+    fragmentation_indicator: int = 0,
+    fragment_counter: int = 0,
+    packet_sequence_number: int = 0,
+) -> bytes:
     """
     テスト用に、シグナリングメッセージ (payload_type=0x02) を運ぶ「ヘッダ圧縮 IP パケット」の TLV パケットを組み立てる
     message_body には MPT 等のテーブルをそのまま渡す (PA message の外側ヘッダは省略し、_ScanForMPT のスキャンで見つかる形にする)
+    シグナリングメッセージのペイロードヘッダは 2 バイト固定 (フラグ群 + fragment_counter) で、
+    fragmentation_indicator を指定すればメッセージを複数パケットに分割したケースも組み立てられる
     """
-    mmtp_header = bytes([0x00, 0x02]) + packet_id.to_bytes(2, byteorder='big') + bytes(8)  # timestamp(4)+packet_sequence_number(4)
-    fragmentation_header = bytes([0x00])  # fragmentation_indicator=0, length_extension_flag=0, aggregation_flag=0
-    mmtp_payload = mmtp_header + fragmentation_header + message_body
+    mmtp_header = (
+        bytes([0x00, 0x02])
+        + packet_id.to_bytes(2, byteorder='big')
+        + bytes(4)  # timestamp
+        + packet_sequence_number.to_bytes(4, byteorder='big')
+    )
+    # 1バイト目: fragmentation_indicator(2bit) + reserved(4bit) + length_extension_flag(1bit) + aggregation_flag(1bit)
+    signalling_header = bytes([(fragmentation_indicator & 0x03) << 6, fragment_counter & 0xFF])
+    mmtp_payload = mmtp_header + signalling_header + message_body
     compressed_ip_payload = bytes([0x00, 0x01, 0x61]) + mmtp_payload  # context_id(2B) + header_type(0x61=圧縮済み)
     return BuildTLVPacket(TLV_PACKET_TYPE_COMPRESSED_IP, compressed_ip_payload)
+
+
+def BuildMHServiceDescriptor(service_type: int, provider_name: str, service_name: str) -> bytes:
+    """テスト用に MH-サービス記述子 (tag=0x8019, MMT-SI なので tag は 16bit) を組み立てる (文字符号は BOM 無し UTF-8)"""
+    provider_name_bytes = provider_name.encode('utf-8')
+    service_name_bytes = service_name.encode('utf-8')
+    body = bytes([service_type, len(provider_name_bytes)]) + provider_name_bytes + bytes([len(service_name_bytes)]) + service_name_bytes
+    return bytes([0x80, 0x19, len(body)]) + body
+
+
+def BuildMHSDTSection(
+    table_id: int,
+    tlv_stream_id: int,
+    original_network_id: int,
+    services: list[tuple[int, bytes, bool]],
+) -> bytes:
+    """
+    テスト用に MH-SDT セクション (table_id=0x9F: 自ストリーム / 0xA0: 他ストリーム) を組み立てる
+    services には (service_id, 記述子ループのバイト列, is_free) のタプルを渡す
+    """
+    service_loop = bytearray()
+    for service_id, descriptors, is_free in services:
+        service_loop += service_id.to_bytes(2, byteorder='big')
+        service_loop += bytes([0xFF])  # reserved_future_use(3bit) + EIT フラグ群(5bit)
+        free_ca_mode = 0 if is_free else 1
+        # running_status(3bit)=4 (動作中) + free_CA_mode(1bit) + descriptors_loop_length(12bit)
+        service_loop += bytes([(4 << 5) | (free_ca_mode << 4) | ((len(descriptors) >> 8) & 0x0F), len(descriptors) & 0xFF])
+        service_loop += descriptors
+
+    body = bytearray()
+    body += tlv_stream_id.to_bytes(2, byteorder='big')
+    body += bytes([0xC1, 0x00, 0x00])  # reserved/version_number/current_next_indicator, section_number, last_section_number
+    body += original_network_id.to_bytes(2, byteorder='big')
+    body += bytes([0xFF])  # reserved_future_use
+    body += service_loop
+
+    section_length = len(body) + 4  # +4: CRC32
+    section = bytes([table_id, 0xB0 | ((section_length >> 8) & 0x0F), section_length & 0xFF]) + bytes(body)
+    return AppendCRC32(section)
+
+
+def BuildM2SectionMessage(section: bytes) -> bytes:
+    """テスト用に M2 セクションメッセージ (message_id=0x8000) を組み立てる (message_id(2B) + version(1B) + length(2B) + セクション)"""
+    return bytes([0x80, 0x00, 0x00]) + len(section).to_bytes(2, byteorder='big') + section
 
 
 def BuildTLVNITPacket(network_id: int, network_name: str, tlv_stream_ids: list[int]) -> bytes:
@@ -332,3 +394,169 @@ class TestMMTAnalyzerTruncatedSalvage:
         mmt_info = MMTAnalyzer().analyze(b'', carrier_group=carrier_group)
         assert mmt_info.is_multi_carrier_partial is True
         assert mmt_info.carrier_group == carrier_group
+
+
+class TestMHSDTSynthetic:
+    """合成データによる MH-SDT (ARIB STD-B60) 解析のテスト (実在の放送局名や実受信環境の値は一切使わない)"""
+
+    @staticmethod
+    def _BuildMHSDTPacket(table_id: int, services: list[tuple[int, bytes, bool]], tlv_stream_id: int = 0xB070) -> bytes:
+        """MH-SDT セクションを M2 セクションメッセージに包み、packet_id=0x8004 のシグナリング TLV パケットにして返す"""
+        section = BuildMHSDTSection(table_id, tlv_stream_id, original_network_id=0x000B, services=services)
+        return BuildSignallingTLVPacket(MMT_SI_PACKET_ID_MH_SDT, BuildM2SectionMessage(section))
+
+    def test_service_name_resolved_from_actual_stream_sdt(self):
+        # 自ストリーム (0x9F) の MH-SDT の service_id と MPT の package_id が一致する場合、MPT サービスにサービス名が反映される
+        video_asset = BuildAssetEntry(b'hev1', location_type=0x00, location_body=(0xF100).to_bytes(2, 'big'))
+        mpt_packet = BuildSignallingTLVPacket(packet_id=0x0000, message_body=BuildMPTTable(package_id=0x65, assets=[video_asset]))
+        descriptors = BuildMHServiceDescriptor(0x01, 'テスト事業者', 'テスト４Ｋ')
+        sdt_packet = self._BuildMHSDTPacket(MH_SDT_TABLE_ID_ACTUAL, [(0x65, descriptors, True)])
+        tlv_stream = ExtractTLVStream(BuildTLVCells(mpt_packet + sdt_packet))
+
+        mmt_info = MMTAnalyzer().analyze(tlv_stream)
+
+        assert len(mmt_info.services) == 1
+        service = mmt_info.services[0]
+        assert service.package_id == 0x65
+        assert service.service_id == 0x65
+        assert service.service_name == 'テスト４Ｋ'
+        assert [asset.asset_type for asset in service.assets] == ['hev1']
+
+        assert len(mmt_info.sdt_services) == 1
+        sdt_service = mmt_info.sdt_services[0]
+        assert sdt_service.service_id == 0x65
+        assert sdt_service.service_name == 'テスト４Ｋ'
+        assert sdt_service.service_provider_name == 'テスト事業者'
+        assert sdt_service.service_type == 0x01
+        assert sdt_service.is_free is True
+        assert sdt_service.running_status == 4
+        assert sdt_service.on_current_stream is True
+
+    def test_other_stream_sdt_listed_but_not_merged_into_services(self):
+        # 他ストリーム (0xA0) の MH-SDT のサービスは sdt_services にのみ載り、MPT のサービス一覧には追加されない
+        video_asset = BuildAssetEntry(b'hev1', location_type=0x00, location_body=(0xF100).to_bytes(2, 'big'))
+        mpt_packet = BuildSignallingTLVPacket(packet_id=0x0000, message_body=BuildMPTTable(package_id=0x65, assets=[video_asset]))
+        own_packet = self._BuildMHSDTPacket(
+            MH_SDT_TABLE_ID_ACTUAL, [(0x65, BuildMHServiceDescriptor(0x01, 'テスト事業者', 'テスト４Ｋ'), True)]
+        )
+        other_packet = self._BuildMHSDTPacket(
+            MH_SDT_TABLE_ID_OTHER,
+            [
+                (0x67, BuildMHServiceDescriptor(0x01, 'テスト事業者', 'テスト８Ｋ'), False),
+                (0x66, BuildMHServiceDescriptor(0x01, '', '　'), True),
+            ],
+            tlv_stream_id=0xB071,
+        )
+        tlv_stream = ExtractTLVStream(BuildTLVCells(mpt_packet + own_packet + other_packet))
+
+        mmt_info = MMTAnalyzer().analyze(tlv_stream)
+
+        assert [service.package_id for service in mmt_info.services] == [0x65]
+        # sdt_services は自ストリーム/他ストリームを統合し、service_id 昇順で並ぶ
+        assert [sdt_service.service_id for sdt_service in mmt_info.sdt_services] == [0x65, 0x66, 0x67]
+        assert [sdt_service.on_current_stream for sdt_service in mmt_info.sdt_services] == [True, False, False]
+        # 未サービスイン枠 (サービス名が全角空白・有料扱い) も除外せずそのまま出力する
+        assert mmt_info.sdt_services[1].service_name == '　'
+        assert mmt_info.sdt_services[2].service_name == 'テスト８Ｋ'
+        assert mmt_info.sdt_services[2].is_free is False
+
+    def test_service_without_mpt_is_added_with_empty_assets(self):
+        # MPT が取得できず自ストリームの MH-SDT だけが取得できた場合 (8K マルチキャリア分散伝送で発生しうる)、
+        # アセット一覧が空のサービスとして補完される
+        descriptors = BuildMHServiceDescriptor(0x01, 'テスト事業者', 'テスト８Ｋ')
+        sdt_packet = self._BuildMHSDTPacket(MH_SDT_TABLE_ID_ACTUAL, [(0x67, descriptors, True)])
+        tlv_stream = ExtractTLVStream(BuildTLVCells(sdt_packet))
+
+        mmt_info = MMTAnalyzer().analyze(tlv_stream)
+
+        assert len(mmt_info.services) == 1
+        assert mmt_info.services[0].package_id == 0x67
+        assert mmt_info.services[0].service_id == 0x67
+        assert mmt_info.services[0].service_name == 'テスト８Ｋ'
+        assert mmt_info.services[0].assets == []
+
+    def test_section_with_invalid_crc32_is_rejected(self):
+        # CRC32 が壊れている MH-SDT セクションは棄却され、サービス名も反映されない
+        video_asset = BuildAssetEntry(b'hev1', location_type=0x00, location_body=(0xF100).to_bytes(2, 'big'))
+        mpt_packet = BuildSignallingTLVPacket(packet_id=0x0000, message_body=BuildMPTTable(package_id=0x65, assets=[video_asset]))
+        section = BuildMHSDTSection(
+            MH_SDT_TABLE_ID_ACTUAL,
+            0xB070,
+            original_network_id=0x000B,
+            services=[(0x65, BuildMHServiceDescriptor(0x01, 'テスト事業者', 'テスト４Ｋ'), True)],
+        )
+        corrupted_section = section[:-1] + bytes([section[-1] ^ 0xFF])  # CRC32 の最終バイトを壊す
+        sdt_packet = BuildSignallingTLVPacket(MMT_SI_PACKET_ID_MH_SDT, BuildM2SectionMessage(corrupted_section))
+        tlv_stream = ExtractTLVStream(BuildTLVCells(mpt_packet + sdt_packet))
+
+        mmt_info = MMTAnalyzer().analyze(tlv_stream)
+
+        assert mmt_info.sdt_services == []
+        assert len(mmt_info.services) == 1
+        assert mmt_info.services[0].service_name == 'Unknown'
+        assert mmt_info.services[0].service_id is None
+
+    def test_fragmented_sdt_is_reassembled(self):
+        # 複数の MMTP パケットに分割 (fragmentation) された MH-SDT が再組み立てされること
+        section = BuildMHSDTSection(
+            MH_SDT_TABLE_ID_ACTUAL,
+            0xB070,
+            original_network_id=0x000B,
+            services=[
+                (0x65, BuildMHServiceDescriptor(0x01, 'テスト事業者', 'テスト４Ｋ'), True),
+                (0x66, BuildMHServiceDescriptor(0x01, 'テスト事業者', 'テスト４Ｋ第二'), True),
+            ],
+        )
+        message = BuildM2SectionMessage(section)
+        split1 = len(message) // 3
+        split2 = split1 * 2
+        packets = (
+            BuildSignallingTLVPacket(
+                MMT_SI_PACKET_ID_MH_SDT, message[:split1], fragmentation_indicator=1, fragment_counter=2, packet_sequence_number=10
+            )
+            + BuildSignallingTLVPacket(
+                MMT_SI_PACKET_ID_MH_SDT,
+                message[split1:split2],
+                fragmentation_indicator=2,
+                fragment_counter=1,
+                packet_sequence_number=11,
+            )
+            + BuildSignallingTLVPacket(
+                MMT_SI_PACKET_ID_MH_SDT, message[split2:], fragmentation_indicator=3, fragment_counter=0, packet_sequence_number=12
+            )
+        )
+        tlv_stream = ExtractTLVStream(BuildTLVCells(packets))
+
+        mmt_info = MMTAnalyzer().analyze(tlv_stream)
+
+        assert [sdt_service.service_name for sdt_service in mmt_info.sdt_services] == ['テスト４Ｋ', 'テスト４Ｋ第二']
+
+    def test_fragment_with_sequence_number_gap_is_discarded(self):
+        # 途中のフラグメントが欠落している (packet_sequence_number が飛んでいる) 場合は再組み立てを破棄する
+        section = BuildMHSDTSection(
+            MH_SDT_TABLE_ID_ACTUAL,
+            0xB070,
+            original_network_id=0x000B,
+            services=[(0x65, BuildMHServiceDescriptor(0x01, 'テスト事業者', 'テスト４Ｋ'), True)],
+        )
+        message = BuildM2SectionMessage(section)
+        split = len(message) // 2
+        packets = BuildSignallingTLVPacket(
+            MMT_SI_PACKET_ID_MH_SDT, message[:split], fragmentation_indicator=1, packet_sequence_number=10
+        ) + BuildSignallingTLVPacket(MMT_SI_PACKET_ID_MH_SDT, message[split:], fragmentation_indicator=3, packet_sequence_number=12)
+        tlv_stream = ExtractTLVStream(BuildTLVCells(packets))
+
+        assert MMTAnalyzer().analyze(tlv_stream).sdt_services == []
+
+    def test_non_sdt_packet_id_is_not_parsed_as_sdt(self):
+        # MH-SDT 用の packet_id (0x8004) 以外で運ばれてきた M2 セクションメッセージは MH-SDT として扱わない
+        section = BuildMHSDTSection(
+            MH_SDT_TABLE_ID_ACTUAL,
+            0xB070,
+            original_network_id=0x000B,
+            services=[(0x65, BuildMHServiceDescriptor(0x01, 'テスト事業者', 'テスト４Ｋ'), True)],
+        )
+        packet = BuildSignallingTLVPacket(packet_id=0x8005, message_body=BuildM2SectionMessage(section))
+        tlv_stream = ExtractTLVStream(BuildTLVCells(packet))
+
+        assert MMTAnalyzer().analyze(tlv_stream).sdt_services == []

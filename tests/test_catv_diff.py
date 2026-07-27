@@ -7,6 +7,7 @@ from isdb_scanner.catv.constants import (
     CATVMMTInfo,
     CATVServiceInfo,
     CATVTransportStreamInfo,
+    MMTSDTServiceInfo,
     MMTServiceInfo,
 )
 from isdb_scanner.catv.diff import CompareScanResults, FormatScanDiff
@@ -209,7 +210,9 @@ class TestCompareScanResultsChannelChanged:
         assert change.retransmission_source_changes[0].current_source == 'BS'
 
 
-def BuildTLVCarrierDict(physical_channel: str, services: list[tuple[int, str]]) -> dict[str, Any]:
+def BuildTLVCarrierDict(
+    physical_channel: str, services: list[tuple[int, str]], sdt_services: list[tuple[int, str]] | None = None
+) -> dict[str, Any]:
     """テスト用に、TLV (4K/8K MMT) キャリアの CATV.json 1エントリ分の dict を組み立てる"""
 
     carrier = CATVCarrierInfo(
@@ -218,6 +221,9 @@ def BuildTLVCarrierDict(physical_channel: str, services: list[tuple[int, str]]) 
         transport_streams=[],
         mmt=CATVMMTInfo(
             services=[MMTServiceInfo(package_id=package_id, service_name=service_name) for package_id, service_name in services],
+            sdt_services=[
+                MMTSDTServiceInfo(service_id=service_id, service_name=service_name) for service_id, service_name in sdt_services or []
+            ],
         ),
     )
     return carrier.model_dump(mode='json')
@@ -249,9 +255,43 @@ class TestCompareScanResultsMMTServices:
         assert '~ MMT service renamed: package_id=0x0001 "Service A" -> "Service A Renamed"' in text
 
     def test_identical_mmt_services_no_change(self):
-        carrier_dict = BuildTLVCarrierDict('CATV_C36', [(0x01, 'Service A')])
+        carrier_dict = BuildTLVCarrierDict('CATV_C36', [(0x01, 'Service A')], sdt_services=[(0x01, 'Service A')])
         diff = CompareScanResults({'CATV_C36': carrier_dict}, {'CATV_C36': carrier_dict})
         assert diff.has_changes is False
+
+    def test_mmt_sdt_service_added_removed_and_renamed(self):
+        # MH-SDT 由来の放送網内サービス一覧 (service_id 単位) の増減・改名も検出できること
+        previous = {
+            'CATV_C36': BuildTLVCarrierDict('CATV_C36', [(0x01, 'Service A')], sdt_services=[(0x01, 'Service A'), (0x02, 'Service B')])
+        }
+        current = {
+            'CATV_C36': BuildTLVCarrierDict('CATV_C36', [(0x01, 'Service A')], sdt_services=[(0x01, 'Service A'), (0x03, 'Service C')])
+        }
+
+        diff = CompareScanResults(previous, current)
+
+        assert len(diff.changed_channels) == 1
+        change = diff.changed_channels[0]
+        assert [service.service_id for service in change.added_mmt_sdt_services] == [0x03]
+        assert [service.service_id for service in change.removed_mmt_sdt_services] == [0x02]
+        assert change.renamed_mmt_sdt_services == []
+
+        text = FormatScanDiff(diff)
+        assert '+ MH-SDT service added: service_id=0x0003 (Service C)' in text
+        assert '- MH-SDT service removed: service_id=0x0002 (Service B)' in text
+
+    def test_mmt_sdt_service_renamed(self):
+        previous = {'CATV_C36': BuildTLVCarrierDict('CATV_C36', [], sdt_services=[(0x01, 'Service A')])}
+        current = {'CATV_C36': BuildTLVCarrierDict('CATV_C36', [], sdt_services=[(0x01, 'Service A Renamed')])}
+
+        diff = CompareScanResults(previous, current)
+
+        change = diff.changed_channels[0]
+        assert len(change.renamed_mmt_sdt_services) == 1
+        assert change.renamed_mmt_sdt_services[0].service_id == 0x01
+        assert change.renamed_mmt_sdt_services[0].previous_service_name == 'Service A'
+        assert change.renamed_mmt_sdt_services[0].service_name == 'Service A Renamed'
+        assert '~ MH-SDT service renamed: service_id=0x0001 "Service A" -> "Service A Renamed"' in FormatScanDiff(diff)
 
 
 class TestFormatScanDiff:

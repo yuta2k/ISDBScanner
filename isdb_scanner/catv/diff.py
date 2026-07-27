@@ -8,6 +8,7 @@ from isdb_scanner.catv.constants import (
     CATVTransportStreamInfo,
     ChannelChangeInfo,
     ChannelSummaryInfo,
+    MMTSDTServiceDiffInfo,
     MMTServiceDiffInfo,
     RetransmissionSourceChangeInfo,
     ScanDiff,
@@ -179,6 +180,32 @@ def _CompareChannel(previous: CATVCarrierInfo, current: CATVCarrierInfo) -> Chan
             )
             has_change = True
 
+    # MH-SDT 由来の放送網内サービス一覧 (service_id 単位) の増減・改名を比較する
+    # 他ストリームのサービスは 1 テーブルずつ順次送出されるため、収録タイミング次第で取得できる範囲が変わる点には注意
+    previous_sdt_services = {service.service_id: service for service in (previous.mmt.sdt_services if previous.mmt is not None else [])}
+    current_sdt_services = {service.service_id: service for service in (current.mmt.sdt_services if current.mmt is not None else [])}
+
+    for service_id in sorted(set(current_sdt_services) - set(previous_sdt_services)):
+        service = current_sdt_services[service_id]
+        change.added_mmt_sdt_services.append(MMTSDTServiceDiffInfo(service_id=service_id, service_name=service.service_name))
+        has_change = True
+    for service_id in sorted(set(previous_sdt_services) - set(current_sdt_services)):
+        service = previous_sdt_services[service_id]
+        change.removed_mmt_sdt_services.append(MMTSDTServiceDiffInfo(service_id=service_id, service_name=service.service_name))
+        has_change = True
+    for service_id in sorted(set(previous_sdt_services) & set(current_sdt_services)):
+        previous_service = previous_sdt_services[service_id]
+        current_service = current_sdt_services[service_id]
+        if previous_service.service_name != current_service.service_name:
+            change.renamed_mmt_sdt_services.append(
+                MMTSDTServiceDiffInfo(
+                    service_id=service_id,
+                    service_name=current_service.service_name,
+                    previous_service_name=previous_service.service_name,
+                )
+            )
+            has_change = True
+
     return change if has_change else None
 
 
@@ -274,6 +301,16 @@ def FormatScanDiff(diff: ScanDiff) -> str:
                 lines.append(
                     f'    ~ MMT service renamed: package_id={mmt_diff.package_id:#06x} '
                     f'"{mmt_diff.previous_service_name}" -> "{mmt_diff.service_name}"'
+                )
+
+            for sdt_diff in change.added_mmt_sdt_services:
+                lines.append(f'    + MH-SDT service added: service_id={sdt_diff.service_id:#06x} ({sdt_diff.service_name})')
+            for sdt_diff in change.removed_mmt_sdt_services:
+                lines.append(f'    - MH-SDT service removed: service_id={sdt_diff.service_id:#06x} ({sdt_diff.service_name})')
+            for sdt_diff in change.renamed_mmt_sdt_services:
+                lines.append(
+                    f'    ~ MH-SDT service renamed: service_id={sdt_diff.service_id:#06x} '
+                    f'"{sdt_diff.previous_service_name}" -> "{sdt_diff.service_name}"'
                 )
 
             for cas_change in change.cas_changes:

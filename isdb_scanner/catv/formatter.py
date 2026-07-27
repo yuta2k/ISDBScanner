@@ -90,18 +90,33 @@ def NormalizeChannelName(name: str) -> str:
 
 
 def _BuildExcludedTLVChannelLines(carriers: list[CATVCarrierInfo], recorder_name: str) -> list[str]:
-    """TLV (4K/8K MMT) キャリアを出力から除外した旨の注記コメント行を組み立てる (該当キャリアがなければ空リスト)"""
+    """
+    TLV (4K/8K MMT) キャリアを出力から除外した旨の注記コメント行を組み立てる (該当キャリアがなければ空リスト)
+    MH-SDT からサービス名を取得できている場合は、どのチャンネルが除外されたのかを特定しやすいよう併記する
+    """
 
-    excluded_tlv_channels = sorted(
-        carrier.physical_channel for carrier in carriers if carrier.carrier_type == CarrierType.TLV
+    excluded_tlv_carriers = sorted(
+        (carrier for carrier in carriers if carrier.carrier_type == CarrierType.TLV),
+        key=lambda carrier: carrier.physical_channel,
     )
-    if len(excluded_tlv_channels) == 0:
+    if len(excluded_tlv_carriers) == 0:
         return []
-    return [
+
+    lines = [
         '#',
         f'# 以下の物理チャンネルは TLV/MMT (4K/8K) キャリアのため、TS ベースの {recorder_name} では扱えず除外しています:',
-        f'#   {", ".join(excluded_tlv_channels)}',
     ]
+    for carrier in excluded_tlv_carriers:
+        service_names = [
+            service.service_name
+            for service in (carrier.mmt.services if carrier.mmt is not None else [])
+            if service.service_name != 'Unknown'
+        ]
+        if len(service_names) > 0:
+            lines.append(f'#   {carrier.physical_channel}: {", ".join(service_names)}')
+        else:
+            lines.append(f'#   {carrier.physical_channel}')
+    return lines
 
 
 class CATVJSONFormatter(CATVBaseFormatter):
