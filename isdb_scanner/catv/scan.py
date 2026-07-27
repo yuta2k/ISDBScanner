@@ -60,6 +60,7 @@ def _ScanWorker(
     tuner: CATVTuner,
     channel_queue: queue.Queue[str],
     recording_time: float,
+    tlv_recording_time: float,
     collect_signal_stats: bool,
     print_lock: threading.Lock,
     progress: Progress,
@@ -80,6 +81,8 @@ def _ScanWorker(
         tuner (CATVTuner): このワーカーが専有するチューナー
         channel_queue (queue.Queue[str]): 未スキャンの物理チャンネル名を格納した共有キュー
         recording_time (float): 各チャンネルの録画時間 (秒)
+        tlv_recording_time (float): TLV (4K/8K MMT) キャリアと判定されたチャンネルのみに適用する合計録画時間 (秒)
+            (recording_time 以下の場合は延長しない)
         collect_signal_stats (bool): 信号品質統計を取得するかどうか
         print_lock (threading.Lock): 表示ブロック・解析・集約を直列化するためのロック
         progress (Progress): プログレスバー (1 チャンネル完了ごとに advance する)
@@ -106,6 +109,7 @@ def _ScanWorker(
                     physical_channel,
                     recording_time=recording_time,
                     collect_signal_stats=collect_signal_stats,
+                    tlv_recording_time=tlv_recording_time,
                 )
             finally:
                 tune_time = time.time() - start_time
@@ -136,8 +140,9 @@ def _ScanWorker(
                 progress.advance(task)
             continue
 
-        # 信号品質統計はワーカー専有チューナーのインスタンス状態のため、ロックを取る前に (選局直後に) 読み出しておく
+        # 信号品質統計と収録時間延長の有無はワーカー専有チューナーのインスタンス状態のため、ロックを取る前に (選局直後に) 読み出しておく
         signal_stats = tuner.last_signal_stats
+        recording_extended = tuner.last_recording_extended
 
         # 選局成功時の表示ブロック・解析・集約・プログレス更新はまとめて print_lock 内で直列に行う
         with print_lock:
@@ -149,7 +154,11 @@ def _ScanWorker(
             carrier_info.signal_stats = signal_stats
             carriers.append(carrier_info)
 
-            print(f'[green]Carrier Type[/green]: {carrier_info.carrier_type.value}')
+            # TLV キャリアと判定されて収録時間を延長した場合は、その旨をキャリア種別に添えて表示する
+            carrier_type_text = carrier_info.carrier_type.value
+            if recording_extended is True:
+                carrier_type_text += f' [dim](recording extended to {tlv_recording_time:.1f} seconds)[/dim]'
+            print(f'[green]Carrier Type[/green]: {carrier_type_text}')
             for ts_info in carrier_info.transport_streams:
                 print(
                     f'[green]Transport Stream[/green]: TSID={ts_info.transport_stream_id:#06x} | '
@@ -437,6 +446,13 @@ def main(
         'Use --no-parallel to scan with a single tuner, or --adapter/--adapters to select tuners explicitly.',
     ),
     recording_time: float = typer.Option(10.0, '--recording-time', help='Recording time (seconds) for each channel.'),
+    tlv_recording_time: float = typer.Option(
+        20.0,
+        '--tlv-recording-time',
+        help='Recording time (seconds) for TLV (4K/8K MMT) carriers only, which need longer reception to collect '
+        'all MH-SDT sections. Recording is extended to this total length only when the channel turns out to be a '
+        'TLV carrier. No extension happens when this is less than or equal to --recording-time.',
+    ),
     list_tuners: bool = typer.Option(False, '--list-tuners', help='List available CATV (DVB-C ANNEX_A) tuners and exit.'),
     output_dvbv5_zap_log: bool = typer.Option(False, help='Output dvbv5-zap log to stderr.'),
     collect_signal_stats: bool = typer.Option(
@@ -668,6 +684,7 @@ def main(
                     tuner,
                     channel_queue,
                     recording_time,
+                    tlv_recording_time,
                     collect_signal_stats,
                     print_lock,
                     progress,

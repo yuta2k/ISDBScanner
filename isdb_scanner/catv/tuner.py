@@ -16,8 +16,10 @@ from typing import BinaryIO, ClassVar
 from isdb_scanner.catv.constants import (
     CATV_FREQUENCY_TABLE,
     BuildDvbv5ConfEntryLines,
+    CarrierType,
     CATVSignalStats,
 )
+from isdb_scanner.catv.tsmf import TSMFDemultiplexer
 from isdb_scanner.tuner import TunerOpeningError, TunerOutputError, TunerTuningError
 
 
@@ -31,6 +33,11 @@ READ_CHUNK_SIZE = TS_PACKET_SIZE * 1024
 # 受信できていれば（チューナーオープン時間を含めても）最低でもこの程度のデータは得られるはず
 ## それ未満の場合は選局に失敗しているとみなす (既存 ISDBTuner.tune() の閾値と同じ)
 MIN_OUTPUT_SIZE = 100 * 1024
+
+# 収録中のキャリア種別判定 (ShouldExtendRecordingForTLV()) に使う、受信データ先頭からの最大バイト数
+## キャリア種別の判定はストリーム全体を走査しなくても十分な精度で行えるため、判定コストを一定に抑えるために先頭部分のみを使う
+## (CATV トランスモジュレーション 1 キャリアのビットレートは約 29Mbps = 約 3.6MB/秒 なので、16MB あれば先頭 4 秒強に相当する)
+CARRIER_TYPE_DETECTION_MAX_SIZE = 16 * 1024 * 1024
 
 # DVBv5 ioctl (FE_GET_PROPERTY / FE_GET_INFO) で使う定数
 # 値は Linux Kernel の include/uapi/linux/dvb/frontend.h (enum fe_property / enum fecap_scale_params) の定義そのもの
@@ -96,6 +103,38 @@ class DvbFrontendInfo(ctypes.Structure):
 SIGNAL_STATS_COLLECTION_DELAY = 1.0
 
 
+def ShouldExtendRecordingForTLV(
+    ts_stream: bytes | bytearray,
+    recording_time: float,
+    tlv_recording_time: float | None,
+) -> bool:
+    """
+    収録途中の受信データからキャリア種別を判定し、収録時間を tlv_recording_time 秒まで延長すべきかどうかを返す
+
+    TLV (4K/8K MMT) キャリアでは、MH-SDT に放送網内の全ストリーム分のサービス情報がセクション分割で載っており、
+    既定の 10 秒程度の収録では全セクションが揃わずスキャン結果 (sdt_services) が回によってばらつく
+    (実測では 20 秒収録で毎回全サービスが揃う)。一方 TSMF/SingleTS キャリアは 10 秒で十分なため、
+    TLV キャリアと判定できた場合のみ収録時間を延長する
+
+    Args:
+        ts_stream (bytes | bytearray): 収録途中の受信データ (先頭から recording_time 秒分)
+        recording_time (float): 通常の録画時間 (秒)
+        tlv_recording_time (float | None): TLV キャリアと判定された場合の合計録画時間 (秒).
+            None または recording_time 以下の場合は延長しない
+
+    Returns:
+        bool: 収録時間を延長すべき (= TLV キャリアと判定された) 場合は True
+    """
+
+    # 延長後の秒数が通常の録画時間以下なら延長する意味がないため、キャリア種別の判定自体を省略する
+    if tlv_recording_time is None or tlv_recording_time <= recording_time:
+        return False
+
+    # 判定は先頭 CARRIER_TYPE_DETECTION_MAX_SIZE バイトまでで打ち切る (収録中に実行するため、判定コストを一定に抑える)
+    detection_target = ts_stream[:CARRIER_TYPE_DETECTION_MAX_SIZE]
+    return TSMFDemultiplexer.detect_carrier_type(detection_target) == CarrierType.TLV
+
+
 class CATVTuner:
     """
     CATV トランスモジュレーション (J.83 Annex C 64QAM) 対応チューナーデバイスを dvbv5-zap 経由で操作するクラス
@@ -114,6 +153,11 @@ class CATVTuner:
     このクラスでは既存 ISDBTuner.tune() と同様に別スレッドで標準出力を監視し、
     データが1バイトも届かないまま tune_timeout 秒経過した時点で SIGINT を送って選局失敗と判断する
     (ロックさえ成功すれば、あとは dvbv5-zap 自身の `-t recording_time` 経過で自動終了するのを待てばよい)
+
+    また `-t` は起動後に延長できない一方、収録中の SIGINT はいつでも受け付けて収録を終了できるため、
+    tune() の tlv_recording_time (TLV キャリアのみ収録時間を延長するオプション) は
+    「最初から延長後の秒数で起動しておき、TLV キャリアでなければ recording_time 経過時点で SIGINT を送って打ち切る」
+    という形で実現している (詳細は tune() 内のコメント参照)
     """
 
     # 全チャンネル分の dvbv5 conf ファイルは同一プロセス内で使い回すため、初回生成時にクラス変数へキャッシュする
@@ -140,6 +184,9 @@ class CATVTuner:
         # 直近の tune() 呼び出しで取得できた信号品質統計 (collect_signal_stats=False の場合、または取得に失敗した場合は None)
         self.last_signal_stats: CATVSignalStats | None = None
 
+        # 直近の tune() 呼び出しで、TLV キャリアと判定されて収録時間が tlv_recording_time まで延長されたかどうか
+        self.last_recording_extended: bool = False
+
     @property
     def name(self) -> str:
         """デバイス名 (取得できなければ device_path をそのまま使う)"""
@@ -155,6 +202,7 @@ class CATVTuner:
         recording_time: float = 10.0,
         tune_timeout: float = 10.0,
         collect_signal_stats: bool = False,
+        tlv_recording_time: float | None = None,
     ) -> bytearray:
         """
         チューナーデバイスから指定された CATV 物理チャンネルを受信し、選局/受信できなかった場合は例外を送出する
@@ -165,6 +213,8 @@ class CATVTuner:
             tune_timeout (float, optional): 選局 (フロントエンドのロック) のタイムアウト時間 (秒). Defaults to 10.0.
             collect_signal_stats (bool, optional): 選局 (ロック) 成功後、信号品質統計を取得し self.last_signal_stats に
                 格納するかどうか (取得に失敗しても例外は送出されず、last_signal_stats が None のままになる). Defaults to False.
+            tlv_recording_time (float | None, optional): TLV (4K/8K MMT) キャリアと判定された場合に限り、収録を続行して
+                合計でこの秒数だけ録画する (None または recording_time 以下の場合は延長しない). Defaults to None.
 
         Returns:
             bytearray: 受信した TS ストリーム (1 キャリア分)
@@ -179,7 +229,21 @@ class CATVTuner:
             raise TunerTuningError(f'Unknown physical channel: {physical_channel}')
 
         self.last_signal_stats = None
+        self.last_recording_extended = False
         conf_file_path = CATVTuner._getConfFilePath()
+
+        # TLV キャリアのみ収録時間を延長する場合、dvbv5-zap には最初から延長後の秒数を `-t` に指定して起動する
+        # dvbv5-zap は起動後に `-t` の秒数を延長できない (逆に、選局中の SIGINT はいつでも受け付けて収録を終了できる) ため、
+        # 「長めに録っておき、TLV キャリアでないと判明した時点で SIGINT で打ち切る」形で「TLV のときだけ延長」を実現している
+        # dvbv5-zap 側では `-t` のタイムアウトも SIGINT も同じシグナルハンドラ経由で「収録の終了」として扱われるため、
+        # TLV でないキャリアでの挙動は `-t recording_time` を指定した従来と実質同じになる
+        # (選局しっぱなしのプロセスを再起動せずそのまま録り続けられるので、延長時も選局のやり直しやストリームの不連続が発生しない)
+        if tlv_recording_time is not None and tlv_recording_time > recording_time:
+            is_extendable = True
+            total_recording_time = tlv_recording_time
+        else:
+            is_extendable = False
+            total_recording_time = recording_time
 
         command = [
             'dvbv5-zap',
@@ -188,7 +252,7 @@ class CATVTuner:
             '-f', str(self.frontend_number),
             '-P',  # 全 PID を出力 (TSMF ヘッダ 0x002F・TLV 0x002D を含む全 mux を取得するため必須)
             '-o', '-',  # 標準出力に TS を出力
-            '-t', str(recording_time),
+            '-t', str(total_recording_time),
             physical_channel,
         ]  # fmt: skip
 
@@ -243,20 +307,41 @@ class CATVTuner:
         # ロック直後だと DTV_STAT_PRE_ERROR_BIT_COUNT / DTV_STAT_PRE_TOTAL_BIT_COUNT (誤り率算出用の積算カウンタ) が
         # まだ 0/0 のままで誤り率を算出できないことを実機で確認したため、ロック検知から SIGNAL_STATS_COLLECTION_DELAY
         # 秒だけ待ってから取得することで、カウンタがある程度積算された値を得られるようにしている
+        # is_extendable=True の場合、標準出力へ TS ストリームが届き始めてから recording_time 秒が経過した時点で、
+        # そこまでに受信できたデータからキャリア種別を判定する。TLV キャリアならそのまま dvbv5-zap を走らせ続けて
+        # tlv_recording_time 秒まで収録を延長し、そうでなければ SIGINT を送って従来と同じ recording_time 秒で収録を打ち切る
+        # (dvbv5-zap の `-t` は「選局 (ロック) 完了後から N 秒」であり、プロセス起動〜ロックまでの時間 (実機で約 1 秒) を
+        #  含まないことを実機で確認済み。打ち切り判定の起点もそれに合わせて「最初にデータが届いた時刻」にすることで、
+        #  TLV でないキャリアの収録内容が `-t recording_time` を指定した従来とほぼ同一になる)
         tune_timeout_count = 0.0
         signal_stats_collected = False
         lock_detected_time: float | None = None
         signal_stats_collection_delay = min(SIGNAL_STATS_COLLECTION_DELAY, recording_time / 2)
+        carrier_type_decided = not is_extendable
+        is_interrupted_by_self = False
+        stdout_arrived_time: float | None = None
         while process.poll() is None and tune_timeout_count < tune_timeout:
             time.sleep(0.01)
             if is_stdout_arrived is False:
                 tune_timeout_count += 0.01
-            elif collect_signal_stats is True and signal_stats_collected is False:
+                continue
+            if stdout_arrived_time is None:
+                stdout_arrived_time = time.time()
+            if collect_signal_stats is True and signal_stats_collected is False:
                 if lock_detected_time is None:
                     lock_detected_time = time.time()
                 if time.time() - lock_detected_time >= signal_stats_collection_delay:
                     self.last_signal_stats = self.getSignalStats()
                     signal_stats_collected = True
+            if carrier_type_decided is False and time.time() - stdout_arrived_time >= recording_time:
+                carrier_type_decided = True
+                # stdout は標準出力読み込みスレッドが随時追記しているため、判定にはスライスしたコピーを使う
+                # (bytearray のスライスは GIL 下でアトミックにコピーされるため、追記と競合しても安全)
+                if ShouldExtendRecordingForTLV(stdout[:CARRIER_TYPE_DETECTION_MAX_SIZE], recording_time, tlv_recording_time):
+                    self.last_recording_extended = True
+                else:
+                    process.send_signal(signal.SIGINT)
+                    is_interrupted_by_self = True
 
         # この時点でプロセスが終了しておらず、標準出力からまだ TS ストリームを受け取っていない場合
         # 選局(ロック)がタイムアウトしたとみなし、プロセスに SIGINT を送信して終了させる
@@ -275,7 +360,9 @@ class CATVTuner:
         stderr_thread.join()
 
         # この時点でリターンコードが 0 でなければ選局または受信に失敗している
-        if process.returncode != 0:
+        # (ただし TLV キャリアでないと判定して自ら SIGINT で収録を打ち切った場合は、収録自体は所定の秒数だけ成功しているため、
+        #  dvbv5-zap 側の終了コードが 0 以外になっていても失敗とはみなさない)
+        if is_interrupted_by_self is False and process.returncode != 0:
             stderr_text = stderr.decode('utf-8', errors='replace').strip()
             stderr_lines = [line.strip() for line in stderr_text.splitlines() if line.strip() != '']
             error_message = stderr_lines[-1] if len(stderr_lines) > 0 else 'Channel selection failed due to an unknown error.'

@@ -20,10 +20,13 @@ from tests.test_catv_tuner import FAKE_DVBV5_ZAP_SOURCE
 
 runner = CliRunner()
 
-# 偽の dvbv5-zap が「ロックできない (受信不可)」「受信データが小さすぎる」チャンネルとして予約している物理チャンネル
+# 偽の dvbv5-zap が「ロックできない (受信不可)」「受信データが小さすぎる」「-t の秒数だけ TS を出力し続ける (TLV / TLV 以外)」
+# チャンネルとして予約している物理チャンネル
 # (test_catv_tuner.py の FAKE_DVBV5_ZAP_SOURCE と対応させる。周波数プラン上の一般名であり受信環境固有の情報ではない)
 FAKE_TIMEOUT_CHANNEL = 'CATV_C63'
 FAKE_SMALL_OUTPUT_CHANNEL = 'CATV_C13'
+FAKE_TLV_STREAM_CHANNEL = 'CATV_C14'
+FAKE_TS_STREAM_CHANNEL = 'CATV_C15'
 
 
 @pytest.fixture
@@ -106,6 +109,43 @@ class TestScanParallelIntegration:
         # (c) ロック失敗・受信データ過小のチャンネルは結果に含まれない
         assert FAKE_TIMEOUT_CHANNEL not in catv_json
         assert FAKE_SMALL_OUTPUT_CHANNEL not in catv_json
+
+
+class TestScanTLVRecordingExtension:
+    """--tlv-recording-time (TLV (4K/8K MMT) キャリアと判定されたチャンネルのみ収録時間を延長する) の統合テスト"""
+
+    # 偽の dvbv5-zap は -t で指定された秒数だけ TS を出力し続けるため、収録が延長されたかどうかを実際の挙動で検証できる
+    BASE_ARGS = [
+        '--recording-time', '0.3',
+        '--tlv-recording-time', '0.9',
+        '--no-collect-signal-stats',
+        '--no-diff',
+        '--no-satellite',
+    ]  # fmt: skip
+
+    def test_tlv_carrier_recording_is_extended(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # TLV キャリアと判定されたチャンネルは収録時間が延長され、その旨がコンソールに表示される
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), '--channels', FAKE_TLV_STREAM_CHANNEL, *self.BASE_ARGS])
+
+        assert result.exit_code == 0, result.output
+        assert 'recording extended to 0.9 seconds' in result.output
+        catv_json = json.loads((output_dir / 'CATV.json').read_text(encoding='utf-8'))
+        assert catv_json[FAKE_TLV_STREAM_CHANNEL]['carrier_type'] == 'TLV'
+
+    def test_non_tlv_carrier_recording_is_not_extended(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # TLV キャリアでないチャンネルは --recording-time 秒で収録を打ち切り、延長の表示も出ない
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), '--channels', FAKE_TS_STREAM_CHANNEL, *self.BASE_ARGS])
+
+        assert result.exit_code == 0, result.output
+        assert 'recording extended' not in result.output
+        catv_json = json.loads((output_dir / 'CATV.json').read_text(encoding='utf-8'))
+        assert catv_json[FAKE_TS_STREAM_CHANNEL]['carrier_type'] != 'TLV'
 
 
 class TestScanTunerFailover:
