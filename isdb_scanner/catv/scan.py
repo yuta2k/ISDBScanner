@@ -43,6 +43,7 @@ from isdb_scanner.catv.formatter import (
     GetEmittedCATVChannelTypes,
     NativeJSONFormatter,
 )
+from isdb_scanner.catv.mmt import MergeMultiCarrierGroupMMTInfo
 from isdb_scanner.catv.native_diff import BuildNativeScanDiffReport
 from isdb_scanner.catv.native_tuner import AsRobustISDBTuners
 from isdb_scanner.catv.satellite import ScanSatelliteChannels
@@ -356,6 +357,11 @@ def _ReformatFromJson(
         print(Rule(characters='=', style=Style(color='#E33157')))
         raise typer.Exit(code=1) from ex
     carriers = sorted(carriers, key=lambda carrier: carrier.physical_channel)
+
+    # 8K マルチキャリア分散伝送のグループ内で MMT シグナリング情報をマージする
+    # (マージ済みの CATV.json に対しては何も変わらない冪等な処理だが、マージ導入前に生成された古い CATV.json からの
+    #  再フォーマットでも、TLV 除外注記にサービス名が出るようにするために実行しておく。JSON 自体は書き換えない)
+    MergeMultiCarrierGroupMMTInfo(carriers)
 
     # Terrestrial.json / BS.json / CS.json は存在すれば復元し、無ければ空扱いにする
     def _LoadNativeJson(file_name: str) -> list[TransportStreamInfo]:
@@ -725,6 +731,12 @@ def main(
 
     # 物理チャンネル順にソートしてから出力
     carriers = sorted(carriers, key=lambda carrier: carrier.physical_channel)
+
+    # 8K マルチキャリア分散伝送のグループを構成するキャリア同士で、MMT シグナリング情報をマージする
+    # (1 本の TLV ストリームを分散伝送しているだけなので、キャリアごとに断片的にしか届かないシグナリングを
+    #  グループ内でマージした結果こそが本来のストリームの内容になる。詳細は MergeMultiCarrierGroupMMTInfo の docstring 参照)
+    # 差分レポートの生成より前に実行し、CATV.json にもマージ後の内容を出力する
+    MergeMultiCarrierGroupMMTInfo(carriers)
 
     # 出力先に既存の CATV.json があれば、上書きする前に読み込んで前回との差分レポートを生成する
     # (--no-diff が指定されている場合や、そもそも前回のスキャン結果が存在しない場合はスキップする)

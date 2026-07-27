@@ -1,4 +1,15 @@
 from isdb_scanner.catv.cas import _CalculateCRC32MPEG
+from isdb_scanner.catv.constants import (
+    CarrierType,
+    CATVCarrierInfo,
+    CATVMMTInfo,
+    MMTAssetInfo,
+    MMTSDTServiceInfo,
+    MMTServiceInfo,
+    TLVCarrierGroupInfo,
+    TLVNetworkInfo,
+    TLVStreamEntryInfo,
+)
 from isdb_scanner.catv.mmt import (
     MH_SDT_TABLE_ID_ACTUAL,
     MH_SDT_TABLE_ID_OTHER,
@@ -8,6 +19,7 @@ from isdb_scanner.catv.mmt import (
     TLV_SYNC_BYTE,
     ExtractTLVCarrierGroupInfo,
     ExtractTLVStream,
+    MergeMultiCarrierGroupMMTInfo,
     MMTAnalyzer,
 )
 from isdb_scanner.catv.tsmf import TLV_CELL_PID, TS_PACKET_SIZE, TS_SYNC_BYTE, TSMF_HEADER_PID, GetPID
@@ -560,3 +572,281 @@ class TestMHSDTSynthetic:
         tlv_stream = ExtractTLVStream(BuildTLVCells(packet))
 
         assert MMTAnalyzer().analyze(tlv_stream).sdt_services == []
+
+
+class TestMergeMultiCarrierGroupMMTInfo:
+    """
+    8K マルチキャリア分散伝送のグループ内マージ (MergeMultiCarrierGroupMMTInfo) のテスト
+    合成データのみを使い、実在の放送局名や実受信環境の ID 値は一切使わない
+    """
+
+    @staticmethod
+    def _BuildCarrier(
+        physical_channel: str,
+        *,
+        group_carrier_index: int | None = 1,
+        group_carrier_count: int = 3,
+        tlv_stream_id: int = 0x1001,
+        network_id: int = 0x0AAA,
+        group_id: int = 0x07,
+        services: list[MMTServiceInfo] | None = None,
+        sdt_services: list[MMTSDTServiceInfo] | None = None,
+        network: TLVNetworkInfo | None = None,
+    ) -> CATVCarrierInfo:
+        """テスト用の TLV キャリア 1 本分の解析結果を組み立てる (group_carrier_index=None なら carrier_group なし)"""
+        carrier_group = (
+            None
+            if group_carrier_index is None
+            else TLVCarrierGroupInfo(
+                tlv_stream_id=tlv_stream_id,
+                network_id=network_id,
+                group_id=group_id,
+                group_carrier_count=group_carrier_count,
+                group_carrier_index=group_carrier_index,
+            )
+        )
+        return CATVCarrierInfo(
+            physical_channel=physical_channel,
+            carrier_type=CarrierType.TLV,
+            mmt=CATVMMTInfo(
+                network=network,
+                services=services or [],
+                sdt_services=sdt_services or [],
+                carrier_group=carrier_group,
+                is_multi_carrier_partial=group_carrier_count >= 2,
+            ),
+        )
+
+    @staticmethod
+    def _BuildSDTService(service_id: int, service_name: str = 'Unknown', *, on_current_stream: bool = False) -> MMTSDTServiceInfo:
+        return MMTSDTServiceInfo(service_id=service_id, service_name=service_name, on_current_stream=on_current_stream)
+
+    def test_services_and_sdt_services_are_merged_across_group_carriers(self):
+        # 同一グループの 3 キャリアに部分的にしか届いていないサービス情報が、マージ後は全キャリアで同一の和集合になる
+        carriers = [
+            self._BuildCarrier(
+                'CATV_C40',
+                group_carrier_index=1,
+                services=[MMTServiceInfo(package_id=0x1101, service_id=0x1101, service_name='テスト８Ｋ')],
+                sdt_services=[self._BuildSDTService(0x1101, 'テスト８Ｋ', on_current_stream=True)],
+            ),
+            self._BuildCarrier(
+                'CATV_C41',
+                group_carrier_index=2,
+                services=[],
+                sdt_services=[self._BuildSDTService(0x1102, 'テスト４Ｋ')],
+            ),
+            self._BuildCarrier(
+                'CATV_C42',
+                group_carrier_index=3,
+                services=[MMTServiceInfo(package_id=0x1103)],
+                sdt_services=[self._BuildSDTService(0x1103, 'テスト４Ｋ２')],
+            ),
+        ]
+
+        MergeMultiCarrierGroupMMTInfo(carriers)
+
+        for carrier in carriers:
+            assert carrier.mmt is not None
+            # package_id / service_id 昇順で、グループ内の全サービスが載っている
+            assert [service.package_id for service in carrier.mmt.services] == [0x1101, 0x1103]
+            assert [sdt_service.service_id for sdt_service in carrier.mmt.sdt_services] == [0x1101, 0x1102, 0x1103]
+            assert [sdt_service.service_name for sdt_service in carrier.mmt.sdt_services] == ['テスト８Ｋ', 'テスト４Ｋ', 'テスト４Ｋ２']
+
+    def test_service_with_more_assets_wins_and_service_name_is_complemented(self):
+        # 同一 package_id はアセット数が多い方 (= より完全な MPT) を採用しつつ、サービス ID / 名は埋まっている方から補完する
+        assets = [MMTAssetInfo(asset_type='hev1', packet_id=0xF100), MMTAssetInfo(asset_type='mp4a', packet_id=0xF101)]
+        carriers = [
+            # MPT は届いたが自ストリームの MH-SDT が届かず、サービス名が不明なキャリア
+            self._BuildCarrier('CATV_C40', group_carrier_index=1, services=[MMTServiceInfo(package_id=0x1101, assets=assets)]),
+            # MPT は届かず MH-SDT からサービス名だけ判明したキャリア (アセット一覧は空)
+            self._BuildCarrier(
+                'CATV_C41',
+                group_carrier_index=2,
+                services=[MMTServiceInfo(package_id=0x1101, service_id=0x1101, service_name='テスト８Ｋ')],
+                sdt_services=[self._BuildSDTService(0x1101, 'テスト８Ｋ', on_current_stream=True)],
+            ),
+        ]
+
+        MergeMultiCarrierGroupMMTInfo(carriers)
+
+        for carrier in carriers:
+            assert carrier.mmt is not None
+            assert len(carrier.mmt.services) == 1
+            service = carrier.mmt.services[0]
+            assert [asset.asset_type for asset in service.assets] == ['hev1', 'mp4a']
+            assert service.service_id == 0x1101
+            assert service.service_name == 'テスト８Ｋ'
+
+    def test_sdt_service_prefers_current_stream_then_named_entry(self):
+        # MH-SDT のサービスは自ストリーム (0x9F) 由来 → サービス名が判明している方、の順で優先される
+        carriers = [
+            self._BuildCarrier(
+                'CATV_C40',
+                group_carrier_index=1,
+                sdt_services=[
+                    self._BuildSDTService(0x1101, 'テスト８Ｋ（他ストリーム）'),
+                    self._BuildSDTService(0x1102),
+                ],
+            ),
+            self._BuildCarrier(
+                'CATV_C41',
+                group_carrier_index=2,
+                sdt_services=[
+                    self._BuildSDTService(0x1101, 'テスト８Ｋ', on_current_stream=True),
+                    self._BuildSDTService(0x1102, 'テスト４Ｋ'),
+                ],
+            ),
+        ]
+
+        MergeMultiCarrierGroupMMTInfo(carriers)
+
+        for carrier in carriers:
+            assert carrier.mmt is not None
+            assert [sdt_service.service_name for sdt_service in carrier.mmt.sdt_services] == ['テスト８Ｋ', 'テスト４Ｋ']
+            assert [sdt_service.on_current_stream for sdt_service in carrier.mmt.sdt_services] == [True, False]
+
+    def test_network_info_is_complemented_only_when_missing(self):
+        # TLV-NIT はグループ内で最も情報量の多いものを、取得できなかったキャリアにのみ補完する
+        rich_network = TLVNetworkInfo(
+            network_id=0x0AAA,
+            network_name='テストネットワーク',
+            tlv_stream_ids=[0x1001],
+            streams=[TLVStreamEntryInfo(tlv_stream_id=0x1001, service_ids=[0x1101], frequencies_hz=[100_000_000, 200_000_000])],
+        )
+        poor_network = TLVNetworkInfo(network_id=0x0AAA, network_name='テストネットワーク（部分）')
+        carriers = [
+            self._BuildCarrier('CATV_C40', group_carrier_index=1, network=None),
+            self._BuildCarrier('CATV_C41', group_carrier_index=2, network=poor_network),
+            self._BuildCarrier('CATV_C42', group_carrier_index=3, network=rich_network),
+        ]
+
+        MergeMultiCarrierGroupMMTInfo(carriers)
+
+        # 取得できていなかったキャリアには最も情報量の多い TLV-NIT が補完される
+        assert carriers[0].mmt is not None and carriers[0].mmt.network is not None
+        assert carriers[0].mmt.network.network_name == 'テストネットワーク'
+        assert len(carriers[0].mmt.network.streams) == 1
+        # すでに取得できているキャリアの TLV-NIT は上書きしない
+        assert carriers[1].mmt is not None and carriers[1].mmt.network is not None
+        assert carriers[1].mmt.network.network_name == 'テストネットワーク（部分）'
+
+    def test_merged_services_are_independent_instances(self):
+        # マージ結果はキャリアごとに独立したコピーであり、片方への変更が他方に波及しない
+        carriers = [
+            self._BuildCarrier(
+                'CATV_C40',
+                group_carrier_index=1,
+                services=[MMTServiceInfo(package_id=0x1101, service_name='テスト８Ｋ')],
+                sdt_services=[self._BuildSDTService(0x1101, 'テスト８Ｋ', on_current_stream=True)],
+            ),
+            self._BuildCarrier('CATV_C41', group_carrier_index=2),
+        ]
+
+        MergeMultiCarrierGroupMMTInfo(carriers)
+
+        assert carriers[0].mmt is not None and carriers[1].mmt is not None
+        assert carriers[0].mmt.services[0] is not carriers[1].mmt.services[0]
+        assert carriers[0].mmt.sdt_services[0] is not carriers[1].mmt.sdt_services[0]
+        carriers[0].mmt.services[0].service_name = '書き換え'
+        assert carriers[1].mmt.services[0].service_name == 'テスト８Ｋ'
+
+    def test_single_carrier_and_other_group_are_not_affected(self):
+        # 単独キャリア (group_carrier_count=1) や別グループのキャリアはマージ対象にならない
+        single_carrier = self._BuildCarrier(
+            'CATV_C30',
+            group_carrier_index=1,
+            group_carrier_count=1,
+            tlv_stream_id=0x1000,
+            services=[MMTServiceInfo(package_id=0x1001, service_name='テスト４Ｋ')],
+            sdt_services=[self._BuildSDTService(0x1001, 'テスト４Ｋ', on_current_stream=True)],
+        )
+        other_group_carriers = [
+            self._BuildCarrier(
+                'CATV_C50',
+                group_carrier_index=1,
+                tlv_stream_id=0x1002,
+                group_id=0x08,
+                services=[MMTServiceInfo(package_id=0x1201, service_name='別グループ８Ｋ')],
+            ),
+            self._BuildCarrier('CATV_C51', group_carrier_index=2, tlv_stream_id=0x1002, group_id=0x08),
+        ]
+        carriers = [
+            single_carrier,
+            self._BuildCarrier('CATV_C40', group_carrier_index=1, services=[MMTServiceInfo(package_id=0x1101)]),
+            self._BuildCarrier('CATV_C41', group_carrier_index=2, services=[MMTServiceInfo(package_id=0x1102)]),
+            *other_group_carriers,
+        ]
+
+        MergeMultiCarrierGroupMMTInfo(carriers)
+
+        # 単独キャリアの内容は一切変わらない
+        assert single_carrier.mmt is not None
+        assert [service.package_id for service in single_carrier.mmt.services] == [0x1001]
+        assert [sdt_service.service_id for sdt_service in single_carrier.mmt.sdt_services] == [0x1001]
+        # 別グループのキャリア同士でのみマージされ、他グループのサービスは混ざらない
+        assert carriers[1].mmt is not None and carriers[2].mmt is not None
+        assert [service.package_id for service in carriers[1].mmt.services] == [0x1101, 0x1102]
+        assert [service.package_id for service in carriers[2].mmt.services] == [0x1101, 0x1102]
+        for carrier in other_group_carriers:
+            assert carrier.mmt is not None
+            assert [service.package_id for service in carrier.mmt.services] == [0x1201]
+
+    def test_carrier_without_carrier_group_or_mmt_is_ignored(self):
+        # TSMF ヘッダから carrier_group を取得できなかった TLV キャリアや、TLV でない (mmt=None の) キャリアは対象外
+        no_group_carrier = self._BuildCarrier(
+            'CATV_C40', group_carrier_index=None, services=[MMTServiceInfo(package_id=0x1101, service_name='テスト８Ｋ')]
+        )
+        group_carriers = [
+            self._BuildCarrier('CATV_C41', group_carrier_index=1, services=[MMTServiceInfo(package_id=0x1102)]),
+            self._BuildCarrier('CATV_C42', group_carrier_index=2, services=[MMTServiceInfo(package_id=0x1103)]),
+        ]
+        tsmf_carrier = CATVCarrierInfo(physical_channel='CATV_15', carrier_type=CarrierType.TSMF)
+        carriers = [no_group_carrier, *group_carriers, tsmf_carrier]
+
+        MergeMultiCarrierGroupMMTInfo(carriers)
+
+        assert no_group_carrier.mmt is not None
+        assert [service.package_id for service in no_group_carrier.mmt.services] == [0x1101]
+        for carrier in group_carriers:
+            assert carrier.mmt is not None
+            assert [service.package_id for service in carrier.mmt.services] == [0x1102, 0x1103]
+        assert tsmf_carrier.mmt is None
+
+    def test_group_with_only_one_scanned_carrier_is_unchanged(self):
+        # グループの一員だが他のキャリアがスキャン対象に含まれていない場合 (--channels で一部のみスキャンした場合など) は何もしない
+        carrier = self._BuildCarrier(
+            'CATV_C40',
+            group_carrier_index=2,
+            services=[MMTServiceInfo(package_id=0x1101, service_name='テスト８Ｋ')],
+            sdt_services=[self._BuildSDTService(0x1101, 'テスト８Ｋ', on_current_stream=True)],
+        )
+        services_before = [service.model_copy(deep=True) for service in carrier.mmt.services] if carrier.mmt else []
+
+        MergeMultiCarrierGroupMMTInfo([carrier])
+
+        assert carrier.mmt is not None
+        assert carrier.mmt.services == services_before
+
+    def test_merge_is_idempotent(self):
+        # マージ済みの結果を再度マージしても内容は変わらない (--from-json 再フォーマット時に二重適用されても安全)
+        carriers = [
+            self._BuildCarrier(
+                'CATV_C40',
+                group_carrier_index=1,
+                services=[MMTServiceInfo(package_id=0x1101, assets=[MMTAssetInfo(asset_type='hev1', packet_id=0xF100)])],
+                sdt_services=[self._BuildSDTService(0x1101, 'テスト８Ｋ', on_current_stream=True)],
+            ),
+            self._BuildCarrier(
+                'CATV_C41',
+                group_carrier_index=2,
+                services=[MMTServiceInfo(package_id=0x1101, service_id=0x1101, service_name='テスト８Ｋ')],
+                sdt_services=[self._BuildSDTService(0x1102, 'テスト４Ｋ')],
+            ),
+        ]
+
+        MergeMultiCarrierGroupMMTInfo(carriers)
+        merged = [carrier.model_copy(deep=True) for carrier in carriers]
+        MergeMultiCarrierGroupMMTInfo(carriers)
+
+        assert carriers == merged

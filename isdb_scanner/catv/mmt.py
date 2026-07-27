@@ -4,6 +4,7 @@ from collections.abc import Iterator
 
 from isdb_scanner.catv.cas import _ParseDescriptors, _VerifySectionCRC32
 from isdb_scanner.catv.constants import (
+    CATVCarrierInfo,
     CATVMMTInfo,
     MMTAssetInfo,
     MMTExternalReferenceInfo,
@@ -904,3 +905,120 @@ class MMTAnalyzer:
             external_references=external_reference_infos,
             multi_carrier_group=multi_carrier_group,
         )
+
+
+def _MergeMMTServiceInfo(base: MMTServiceInfo, other: MMTServiceInfo) -> MMTServiceInfo:
+    """
+    同一 package_id の MPT 由来サービス情報 2 つをマージした新しいインスタンスを返す
+    アセット一覧はより完全な方 (アセット数が多い方) を採用しつつ、サービス ID / サービス名は埋まっている方から補完する
+    (MPT が届いたキャリアと自ストリームの MH-SDT が届いたキャリアが別々になることがあり、
+     アセット一覧を持つ側にサービス名が入っていないことがあるため)
+    """
+
+    if len(other.assets) > len(base.assets):
+        primary, secondary = other, base
+    else:
+        # アセット数が同じ場合は base (先に登録された = キャリア順で先の方) を優先する
+        primary, secondary = base, other
+    merged = primary.model_copy(deep=True)
+    if merged.service_id is None and secondary.service_id is not None:
+        merged.service_id = secondary.service_id
+    if merged.service_name == 'Unknown' and secondary.service_name != 'Unknown':
+        merged.service_name = secondary.service_name
+    return merged
+
+
+def _MergeMMTSDTServiceInfo(base: MMTSDTServiceInfo, other: MMTSDTServiceInfo) -> MMTSDTServiceInfo:
+    """
+    同一 service_id の MH-SDT 由来サービス情報 2 つをマージした新しいインスタンスを返す
+    自ストリーム (table_id=0x9F) 由来の情報を優先し、次いでサービス名が判明している方を優先する
+    (MMTAnalyzer.RegisterSDTServiceInfo のキャリア内での優先順位と同じ考え方)
+    """
+
+    def Rank(sdt_service_info: MMTSDTServiceInfo) -> tuple[bool, bool]:
+        return (sdt_service_info.on_current_stream, sdt_service_info.service_name != 'Unknown')
+
+    # 優先度が同じ場合は base (先に登録された = キャリア順で先の方) を維持する
+    return (other if Rank(other) > Rank(base) else base).model_copy(deep=True)
+
+
+def MergeMultiCarrierGroupMMTInfo(carriers: list[CATVCarrierInfo]) -> None:
+    """
+    8K マルチキャリア分散伝送のグループを構成するキャリア同士で MMT シグナリング情報をマージし、
+    グループ全メンバーの CATVMMTInfo に同一の内容を反映する (引数の carriers の内容を破壊的に更新する)
+
+    8K 放送のマルチキャリア分散伝送では、1 本の TLV ストリーム (同一 tlv_stream_id) を複数の物理キャリアに分散して
+    伝送しているため、どのキャリアに載っているシグナリングも「同じ 1 本の TLV ストリームのシグナリング」であり、
+    グループ内でマージした結果こそが本来の TLV ストリームの内容になる
+    一方で個々のキャリアに届くシグナリングは分散伝送の都合で断片的で、収録のたびに得られるテーブルの部分集合が変わるため、
+    マージせずにキャリア単位の解析結果をそのまま出力すると、以下の問題が起きる:
+      - 定期スキャンの差分レポートに、実際には変わっていないサービスの増減が毎回偽陽性として出る
+      - MPT も自ストリームの MH-SDT も届かなかったキャリアでは services が空になり、
+        Mirakurun/mirakc のチャンネル設定に出力する TLV 除外注記からサービス名が欠落する
+
+    グループの識別には TSMF 多重フレームヘッダ由来の carrier_group (network_id / tlv_stream_id / group_id) を使い、
+    group_carrier_count が 2 以上のキャリアのみを対象とする
+    TLV-NIT 由来の multi_carrier_group はフォールバックとしても使わない (TLV-NIT はマルチキャリアのキャリアでは
+    そもそも取得できないことが多く、かつ「どのキャリアがそのグループの一員か」の判定には結局自キャリアの識別情報が
+    必要になるため、常に完全な形で取得できる TSMF ヘッダ由来の情報だけで判定する方が確実かつ単純)
+
+    単独キャリア (group_carrier_count が 2 未満のキャリア・TLV でないキャリア・TSMF ヘッダを取得できなかったキャリア) は
+    一切変更しない
+
+    Args:
+        carriers (list[CATVCarrierInfo]): スキャンで得られた全キャリアの解析結果 (この関数内で内容が更新される)
+    """
+
+    # (network_id, tlv_stream_id, group_id) が一致するキャリアを同一グループとしてまとめる
+    # (CATVMMTInfo は carrier.mmt が保持しているインスタンスそのものなので、これを更新すれば carriers 側にも反映される)
+    groups: dict[tuple[int, int, int], list[tuple[str, CATVMMTInfo]]] = {}
+    for carrier in carriers:
+        mmt_info = carrier.mmt
+        if mmt_info is None or mmt_info.carrier_group is None:
+            continue
+        carrier_group = mmt_info.carrier_group
+        if carrier_group.group_carrier_count < 2:
+            continue
+        group_key = (carrier_group.network_id, carrier_group.tlv_stream_id, carrier_group.group_id)
+        groups.setdefault(group_key, []).append((carrier.physical_channel, mmt_info))
+
+    for group_members in groups.values():
+        # グループの一員であることが分かっていても、そのグループの他のキャリアがスキャン対象に含まれていない
+        # (--channels で一部のみスキャンした場合など) ことがある。この場合はマージのしようがないので何もしない
+        if len(group_members) < 2:
+            continue
+        # マージ結果がスキャン順 (並列ワーカーの完了順) に依存しないよう、物理チャンネル順に走査する
+        group_members = sorted(group_members, key=lambda member: member[0])
+
+        merged_services: dict[int, MMTServiceInfo] = {}
+        merged_sdt_services: dict[int, MMTSDTServiceInfo] = {}
+        merged_network: TLVNetworkInfo | None = None
+        for _, mmt_info in group_members:
+            for service_info in mmt_info.services:
+                existing_service = merged_services.get(service_info.package_id)
+                merged_services[service_info.package_id] = (
+                    service_info.model_copy(deep=True) if existing_service is None else _MergeMMTServiceInfo(existing_service, service_info)
+                )
+            for sdt_service_info in mmt_info.sdt_services:
+                existing_sdt_service = merged_sdt_services.get(sdt_service_info.service_id)
+                merged_sdt_services[sdt_service_info.service_id] = (
+                    sdt_service_info.model_copy(deep=True)
+                    if existing_sdt_service is None
+                    else _MergeMMTSDTServiceInfo(existing_sdt_service, sdt_service_info)
+                )
+            # TLV-NIT はキャリアによって取得できたりできなかったりするため、グループ内で最も情報量の多い
+            # (ストリームループのエントリ数が多い) ものをグループ共通のネットワーク情報として採用する
+            if mmt_info.network is not None and (merged_network is None or len(mmt_info.network.streams) > len(merged_network.streams)):
+                merged_network = mmt_info.network
+
+        services = sorted(merged_services.values(), key=lambda service_info: service_info.package_id)
+        sdt_services = sorted(merged_sdt_services.values(), key=lambda sdt_service_info: sdt_service_info.service_id)
+        for _, mmt_info in group_members:
+            # キャリア間でモデルのインスタンスを共有すると、片方への変更が意図せず他方に波及してしまうため、
+            # 各キャリアにはそれぞれ独立したコピーを持たせる
+            mmt_info.services = [service_info.model_copy(deep=True) for service_info in services]
+            mmt_info.sdt_services = [sdt_service_info.model_copy(deep=True) for sdt_service_info in sdt_services]
+            # ネットワーク情報は「取得できなかったキャリアの補完」のみ行い、取得できているキャリアの内容は上書きしない
+            # (TLV-NIT はキャリアごとに完全な形で受信できていれば内容も同一のはずのため、無理に統一する必要はない)
+            if mmt_info.network is None and merged_network is not None:
+                mmt_info.network = merged_network.model_copy(deep=True)
