@@ -1,6 +1,8 @@
 import os
 import stat
 import struct
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -147,6 +149,29 @@ class TestCATVTunerConfFile:
         first = CATVTuner._getConfFilePath()
         second = CATVTuner._getConfFilePath()
         assert first == second
+
+    def test_remove_conf_file_is_tolerant(self, tmp_path: Path):
+        # 削除済みのファイルを指定しても例外を送出しない (プロセスの終了処理を妨げないようにするため)
+        conf_file_path = tmp_path / 'isdb_scanner_catv_test.conf'
+        conf_file_path.write_text('', encoding='utf-8')
+        CATVTuner._removeConfFile(conf_file_path)
+        assert conf_file_path.exists() is False
+        CATVTuner._removeConfFile(conf_file_path)
+
+    def test_conf_file_is_removed_on_process_exit(self):
+        # conf ファイルが一時ディレクトリに溜まり続けないよう、生成したプロセスの終了時に削除されることを確認する
+        # (atexit 経由の後始末はプロセスが実際に終了しないと走らないため、別プロセスを起動して検証する)
+        code = 'from isdb_scanner.catv.tuner import CATVTuner; print(CATVTuner._getConfFilePath())'
+        process = subprocess.run(
+            [sys.executable, '-c', code],
+            cwd=Path(__file__).parent.parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        conf_file_path = Path(process.stdout.strip())
+        assert conf_file_path.name.startswith('isdb_scanner_catv_')
+        assert conf_file_path.exists() is False
 
 
 class TestCATVTunerTune:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import ctypes
 import fcntl
 import re
@@ -529,8 +530,26 @@ class CATVTuner:
             with open(fd, mode='w', encoding='utf-8') as f:
                 f.write('\n'.join(lines) + '\n')
 
+            # conf ファイルは dvbv5-zap の起動に必要なだけで、プロセス終了後は不要になるため、
+            # 一時ディレクトリに溜まり続けないようプロセス終了時に削除する
+            # (Ctrl+C による中断でも KeyboardInterrupt がインタプリタの終了処理まで巻き戻るため削除される)
+            atexit.register(CATVTuner._removeConfFile, conf_file_path)
+
             CATVTuner._conf_file_path = conf_file_path
             return conf_file_path
+
+    @staticmethod
+    def _removeConfFile(conf_file_path: Path) -> None:
+        """
+        _getConfFilePath() が生成した dvbv5 形式 conf ファイルを削除する (プロセス終了時に atexit から呼ばれる)
+        既に削除されている場合や、権限などの理由で削除できなかった場合は何もしない
+        (一時ファイルの後始末が失敗しただけでプロセスの終了処理を妨げないようにするため)
+        """
+
+        try:
+            conf_file_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     @staticmethod
     def getAvailableCATVTuners(output_recisdb_log: bool = False) -> list[CATVTuner]:
