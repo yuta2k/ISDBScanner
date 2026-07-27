@@ -4,6 +4,18 @@ from typing import Literal
 from pydantic import BaseModel
 
 
+class PreferredSource(StrEnum):
+    """
+    CATV 再送信とネイティブ (ISDB-T/ISDB-S 直結) で同一 TS が重複したときに、どちらのエントリを優先 (有効なまま) にするか
+    レコーダー (Mirakurun/mirakc) の設定生成時、重複したもう一方のエントリを isDisabled/disabled にして出力するために使う
+    """
+
+    # CATV 再送信 (dvbv5-zap) 側を優先し、重複したネイティブ (recisdb) 側のエントリを disable する
+    CATV = 'catv'
+    # ネイティブ (recisdb) 側を優先し、重複した CATV 再送信 (dvbv5-zap) 側のエントリを disable する
+    NATIVE = 'native'
+
+
 class CarrierType(StrEnum):
     """CATV トランスモジュレーション物理チャンネル (キャリア) の種別"""
 

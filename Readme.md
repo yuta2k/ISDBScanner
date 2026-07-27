@@ -301,6 +301,15 @@ PC に接続したはずのチューナーが認識されていない場合は�
   - 高度 BS デジタル放送 (4K/8K) を再送信している MMT/TLV チャンネルから、サービス・アセット構成やネットワーク情報 (TLV-NIT) を JSON に出力します。**シグナリング情報は非スクランブルのため、ACAS カードなしで解析できます。**
 - **8K マルチキャリア分散伝送の検出**
   - 8K 放送が複数の物理チャンネルに分割して伝送されている場合、TSMF ヘッダの拡張情報や TLV-NIT の周波数リストから、そのグループ構成 (どの物理チャンネルが同じ 8K 放送の一部か) を検出します。
+- **BS/CS 再送信チャンネルの type マッピングとチャンネル名の解決**
+  - BS/CS の再送信 (トランスモジュレーション) チャンネルは、Mirakurun/mirakc のチャンネル設定に `type: GR` 固定ではなく `type: BS` / `type: CS` として出力します。チャンネル名には、TSMF 分離後の SDT から取得した映像サービス名 (例: 「ＢＳ朝日」) を使用します。
+- **ネイティブ地上波/BS/CS スキャンの統合** (`--terrestrial` / `--satellite` 指定時)
+  - ISDB-T / ISDB-S 対応チューナーと recisdb が利用可能な場合、CATV スキャンの完了後にネイティブ地上波 (ISDB-T) / BS/CS (ISDB-S 衛星アンテナ直結) のチャンネルスキャンも実行し、Mirakurun/mirakc 向けのチャンネル設定に CATV 分と地上波/BS/CS 分を統合して出力します (デフォルト: いずれも無効)。CATV パススルー/トランスモジュレーション + 地上波・衛星アンテナ併用環境で、1 回のスキャンでレコーダー設定一式を生成できます。
+  - スキャンは CATV → 地上波 → 衛星の順に直列実行されます。CATV 再送信とネイティブで同一 TS が重複する場合は、`--prefer catv` / `--prefer native` でどちらを有効にするかを自動調整できます (もう一方のエントリは無効化して出力)。
+- **チューナー設定 (tuners) / EDCB 設定の出力**
+  - Mirakurun/mirakc 向けのチューナー設定 (`tuners_catv.yml`) と、EDCB (EDCB-Wine) 向けのチャンネル設定 (`EDCB-Wine/`) も合わせて出力します (EDCB 出力は実機検証未了の実験的機能です)。
+- **既存 JSON からの再フォーマット** (`--from-json` 指定時)
+  - スキャンを行わず、出力先に残っている既存の JSON (`CATV.json` 必須 + `Terrestrial.json` / `BS.json` / `CS.json` は任意) から、出力ファイル群 (dvbv5 conf / Mirakurun・mirakc の channels/tuners / EDCB) だけを再生成します。オプション (`--exclude-pay-tv` など) を変えて設定だけ作り直したいときに使えます。
 
 > [!IMPORTANT]  
 > **CATV 対応では、チューナー受信コマンドとして recisdb ではなく [dvbv5-zap](https://www.linuxtv.org/wiki/index.php/Dvbv5-zap) (DVBv5 Tools / dvb-tools) を使用します。**  
@@ -356,6 +365,19 @@ poetry run isdb-catv-scanner --channels CATV_15,CATV_C36 ./scanned/
 - **`--recording-time <秒>`**: 各物理チャンネルの受信時間 (秒) を指定します (デフォルト: 10 秒)。
 - **`--collect-signal-stats` / `--no-collect-signal-stats`**: 選局中に信号強度・CNR・ビットエラーレートを取得して結果に含めます (デフォルト: 有効)。
 - **`--no-diff`**: 出力先に既存の `CATV.json` があっても、前回スキャンとの差分レポートを生成しません。
+- **`--satellite` / `--no-satellite`**: CATV スキャンの完了後に、ネイティブ BS/CS (衛星アンテナ直結・ISDB-S) のチャンネルスキャンも実行し、Mirakurun/mirakc 向けのチャンネル設定に BS/CS 分を統合して出力します (デフォルト: 無効)。
+  - ネイティブ BS/CS のスキャンには [recisdb](https://github.com/kazuki0824/recisdb-rs) と ISDB-S 対応チューナーが必要です。どちらかが見つからない場合は警告を表示して衛星スキャンのみを自動的にスキップし、CATV スキャンは通常どおり実行されます。
+  - CATV 再送信の BS/CS チャンネルとネイティブ BS/CS チャンネルはどちらも `type: BS` / `type: CS` になるため、併用時は Mirakurun/mirakc が type からチューナー (dvbv5-zap / recisdb) を区別できません。両方が検出された場合は警告を表示するので、`--prefer catv` / `--prefer native` で自動調整するか、生成された設定でどちらか一方を無効化するなどの調整をしてください。
+- **`--terrestrial` / `--no-terrestrial`**: CATV スキャンの完了後に、ネイティブ地上波 (ISDB-T) のチャンネルスキャン (T13〜T62 のフルスキャン) も実行し、Mirakurun/mirakc 向けのチャンネル設定に地上波 (`type: GR`) 分を統合して出力します (デフォルト: 無効)。
+  - ネイティブ地上波のスキャンには [recisdb](https://github.com/kazuki0824/recisdb-rs) と ISDB-T 対応チューナーが必要です。どちらかが見つからない場合は警告を表示して地上波スキャンのみを自動的にスキップし、CATV スキャンは通常どおり実行されます。
+- **`--prefer <catv|native>`**: CATV 再送信とネイティブ (recisdb) で同一 TS (同一の放送種別・TSID) が重複したとき、指定した側のエントリを有効なまま残し、もう一方を Mirakurun の `isDisabled: true` / mirakc の `disabled: true` として出力します。省略時は両方を有効なまま出力し、重複が検出された場合は警告を表示します。
+- **`--normalize-names`**: Mirakurun/mirakc/EDCB のチャンネル名に含まれる全角英数字・記号を半角に正規化して出力します (放送局側で英数字が全角符号化されている場合の見づらさを緩和する任意処理)。デフォルト: 無効。
+- **`--from-json`**: 再フォーマットモード。チューナー検出もスキャンも行わず、出力先の既存 JSON (`CATV.json` 必須) から出力ファイル群 (dvbv5 conf / Mirakurun・mirakc の channels/tuners / EDCB) だけを再生成します。`CATV.json` が見つからない場合はエラー終了します。スキャン関連オプション (`--channels` / `--adapter` / `--satellite` / `--terrestrial` など) は無視され、出力系オプション (`--exclude-pay-tv` / `--bcas-only` / `--cas-as-sky` / `--prefer` / `--normalize-names`) のみが有効です。JSON 群と diff は再生成しません。
+- **`--exclude-pay-tv`**: Mirakurun/mirakc 向けのチャンネル設定から有料放送チャンネルを除外します (CATV エントリ・ネイティブ地上波/BS/CS エントリの両方に適用)。`--satellite` 指定時は CS のスキャン自体も省略します。JSON 出力 (`CATV.json` / `BS.json`) には常に全チャンネルが出力されます。
+- **`--bcas-only`**: Mirakurun/mirakc 向けのチャンネル設定を、B-CAS カードで受信可能なチャンネルのみに限定します (C-CAS/A-CAS が必要なチャンネルと、スクランブルされているが CAS 種別を特定できないチャンネルを除外します)。デフォルト: 無効。
+- **`--cas-as-sky`**: C-CAS/A-CAS が必要なチャンネルを、Mirakurun/mirakc のチャンネル設定に `type: SKY` として出力します (本来は SPHD 用の第4の type を CATV 専用チャンネルの分離に転用するオプション)。デフォルト: 無効。
+- **`--lnb <11v|15v|low>`**: ネイティブ BS/CS のスキャン時の LNB 給電電圧を指定します (デフォルト: `low` = 給電なし)。
+- **`--output-recisdb-log`**: ネイティブ BS/CS のスキャン時に recisdb のログを標準エラー出力に出力します。
 
 > [!NOTE]  
 > 物理チャンネル名は、[日本の CATV で一般的な周波数プラン](https://github.com/yuta2k/ISDBScanner/blob/catv/isdb_scanner/catv/constants.py) に基づき、UHF 帯 (`CATV_13`〜`CATV_62`) と下位バンド (`CATV_C13`〜`CATV_C63`) を定義しています。  
@@ -373,12 +395,28 @@ CATV スキャンは、指定されたディレクトリ以下に以下のファ
   - 前回スキャンからのチャンネル・TS・サービス・CAS 種別・再送信元の増減/変化を、`+` / `-` / `~` のプレフィックス付きのプレーンテキストで出力します。CATV はヘッドエンドの構成変更が起きやすいため、定期スキャンでの差分確認に利用できます。
 - **dvbv5_channels_catv.conf**
   - 受信できた (ロックに成功した) チャンネルのみを収録した、dvbv5 形式のチャンネル設定ファイルです。`dvbv5-zap -c dvbv5_channels_catv.conf ...` でそのまま選局に利用できます。
+- **Terrestrial.json / BS.json / CS.json** (ネイティブ地上波/BS/CS スキャン実行時のみ)
+  - ネイティブ地上波/BS/CS のチャンネルスキャン解析結果を、通常の `isdb-scanner` が出力する `Channels.json` の `Terrestrial` / `BS` / `CS` キーと同じ形式 (TS 情報の JSON 配列) で出力します。
+  - `Terrestrial.json` は `--terrestrial`、`BS.json` / `CS.json` は `--satellite` を指定した場合のみ出力されます。
+  - `--exclude-pay-tv` の指定に関わらず、JSON には取得できた全チャンネルが出力されます (`--exclude-pay-tv` 指定時は CS のスキャン自体を行わないため、`CS.json` は出力されません)。
+- **Terrestrial.diff.txt / BS.diff.txt / CS.diff.txt** (対応するネイティブスキャン実行時 + 前回の JSON が存在する場合のみ)
+  - 前回の `Terrestrial.json` / `BS.json` / `CS.json` と今回のスキャン結果の差分 (物理チャンネル・TSID・サービスの増減/変化) を、`+` / `-` / `~` のプレフィックス付きのプレーンテキストで出力します。`--no-diff` 指定時は生成されません。
 - **Mirakurun/channels_catv.yml**
-  - Mirakurun 用のチャンネル設定 (CATV 部分) です。
+  - Mirakurun 用のチャンネル設定 (CATV 部分 + ネイティブ地上波/BS/CS 部分) です。
   - **Mirakurun は TSMF 分離をネイティブサポートしている ([`tsmfRelTs`](https://github.com/Chinachu/Mirakurun/blob/master/doc/Configuration.md) プロパティ)** ため、TSMF 多重チャンネルには `tsmfRelTs` キーを付与して出力します。ファイル冒頭のコメントに、`dvbv5-zap` を使う `tuners.yml` の記述例を記載しています。
+  - CATV エントリの `type` は再送信元に応じて `GR` (地上波再送信・自主放送) / `BS` / `CS` になります (`--cas-as-sky` 指定時は C-CAS/A-CAS が必要なチャンネルのみ `SKY`)。**CATV チューナーの `types` には、このファイルに現れる全 type を列挙してください** (例: `[GR, BS, CS]`)。
+  - ネイティブ地上波/BS/CS のスキャン (`--terrestrial` / `--satellite`) を実行した場合は、CATV エントリの後にネイティブ地上波 (`type: GR`) / BS/CS のチャンネルエントリ (recisdb で選局・`satellite` キーで TSID 指定) も統合して出力します。ISDB-T/ISDB-S チューナー用の `tuners.yml` の記述例もファイル冒頭のコメントに記載しています。
 - **mirakc/channels_catv.yml**
-  - mirakc 用のチャンネル設定 (CATV 部分) です。
+  - mirakc 用のチャンネル設定 (CATV 部分 + ネイティブ地上波/BS/CS 部分) です。
   - **mirakc は TSMF 分離に対応していない**ため、チューナーコマンドのパイプに `isdb-tsmf-split --rel-ts <番号>` を挟む形の設定例を出力します。
+  - CATV エントリの `type` は Mirakurun と同様に `GR` / `BS` / `CS` (+ `--cas-as-sky` 時は `SKY`) になります。CATV チューナーの `types` にはこのファイルに現れる全 type を列挙してください。
+  - ネイティブ地上波/BS/CS のスキャン (`--terrestrial` / `--satellite`) を実行した場合は、CATV エントリの後にネイティブ地上波 (`type: GR`) / BS/CS のチャンネルエントリ (recisdb で選局・`extra-args` キーで TSID 指定) も統合して出力します。
+- **Mirakurun/tuners_catv.yml / mirakc/tuners_catv.yml**
+  - Mirakurun / mirakc 用のチューナー設定です。検出された CATV チューナー (dvbv5-zap) と、ネイティブスキャンに使った ISDB-T/ISDB-S チューナー (recisdb) を列挙します。
+  - CATV チューナーの `types` には、`channels_catv.yml` に実際に現れる CATV エントリの全 type (`GR` / `BS` / `CS`、`--cas-as-sky` 時は `SKY`) が自動的に列挙されます。
+- **EDCB-Wine/** (実験的機能)
+  - EDCB (EDCB-Wine) 向けのチャンネル設定 (`BonDriver_mirakc(BonDriver_mirakc).ChSet4.txt` / `ChSet5.txt`) を出力します。ネイティブスキャンを実行した場合はネイティブ地上波/BS/CS 分も統合されます。
+  - **実機での動作検証は未了の実験的出力です。** 実運用に使う際は生成された内容を確認してください。
 
 ### TSMF 分離フィルタ
 

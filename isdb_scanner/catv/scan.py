@@ -2,14 +2,21 @@
 
 # isdb-catv-scanner: 日本の CATV トランスモジュレーション (J.83 Annex C 64QAM) の物理チャンネルをスキャンし、
 # 各キャリアの解析結果 (CATV.json) と、受信できたチャンネルのみを収録した dvbv5 形式の conf ファイルを出力する CLI
+# --terrestrial / --satellite 指定時は、ネイティブ地上波 (ISDB-T) / BS/CS (ISDB-S 衛星アンテナ直結) のスキャンも
+# 合わせて行い、Mirakurun/mirakc/EDCB 向けのチャンネル・チューナー設定に CATV 分と統合して出力する
+# --from-json 指定時は、スキャンを行わず既存 JSON から出力ファイル群だけを再生成する
 #
 # 使用例:
 #   isdb-catv-scanner ./scanned/
 #   isdb-catv-scanner --list-tuners
 #   isdb-catv-scanner --channels CATV_15,CATV_C36 --recording-time 15 ./scanned/
+#   isdb-catv-scanner --terrestrial --satellite ./scanned/
+#   isdb-catv-scanner --terrestrial --satellite --prefer native ./scanned/
+#   isdb-catv-scanner --from-json ./scanned/
 
 import json
 import queue
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -23,16 +30,25 @@ from rich.rule import Rule
 from rich.style import Style
 
 from isdb_scanner.catv.analyzer import CATVCarrierAnalyzer
-from isdb_scanner.catv.constants import CATV_FREQUENCY_TABLE, CATVCarrierInfo
+from isdb_scanner.catv.constants import CATV_FREQUENCY_TABLE, CATVCarrierInfo, PreferredSource
 from isdb_scanner.catv.diff import CompareScanResults, FormatScanDiff
+from isdb_scanner.catv.edcb import CATVEDCBChSet4TxtFormatter, CATVEDCBChSet5TxtFormatter
 from isdb_scanner.catv.formatter import (
     CATVDvbv5ConfFormatter,
     CATVJSONFormatter,
     CATVMirakcConfigYmlFormatter,
+    CATVMirakcTunersYmlFormatter,
     CATVMirakurunChannelsYmlFormatter,
+    CATVMirakurunTunersYmlFormatter,
+    GetEmittedCATVChannelTypes,
+    NativeJSONFormatter,
 )
+from isdb_scanner.catv.native_diff import BuildNativeScanDiffReport
+from isdb_scanner.catv.satellite import ScanSatelliteChannels
+from isdb_scanner.catv.terrestrial import ScanTerrestrialChannels
 from isdb_scanner.catv.tuner import CATVTuner
-from isdb_scanner.tuner import TunerOpeningError, TunerOutputError, TunerTuningError
+from isdb_scanner.constants import LNBVoltage, TransportStreamInfo
+from isdb_scanner.tuner import ISDBTuner, TunerOpeningError, TunerOutputError, TunerTuningError
 
 
 app = typer.Typer()
@@ -160,6 +176,221 @@ def _ScanWorker(
             progress.advance(task)
 
 
+def _BuildFormatterKwargs(
+    tr_ts_infos: list[TransportStreamInfo],
+    bs_ts_infos: list[TransportStreamInfo],
+    cs_ts_infos: list[TransportStreamInfo],
+    exclude_pay_tv: bool,
+    bcas_only: bool,
+    cas_as_sky: bool,
+    prefer: PreferredSource | None,
+    normalize_names: bool,
+) -> dict:
+    """
+    channels/EDCB フォーマッター (CATVMirakurunChannelsYmlFormatter / CATVMirakcConfigYmlFormatter /
+    CATVEDCBChSet4TxtFormatter / CATVEDCBChSet5TxtFormatter) に共通で渡すキーワード引数一式を組み立てる
+    (通常スキャン時と --from-json 再フォーマット時で同じ配線を使い回すためのヘルパー)
+    """
+
+    return {
+        'tr_ts_infos': tr_ts_infos,
+        'bs_ts_infos': bs_ts_infos,
+        'cs_ts_infos': cs_ts_infos,
+        'exclude_pay_tv': exclude_pay_tv,
+        'bcas_only': bcas_only,
+        'cas_as_sky': cas_as_sky,
+        'prefer': prefer,
+        'normalize_names': normalize_names,
+    }
+
+
+def _EmitNativeScanDiff(
+    output_dir: Path,
+    band_label: str,
+    current_ts_infos: list[TransportStreamInfo],
+    no_diff: bool,
+) -> None:
+    """
+    ネイティブ (地上波/BS/CS) スキャン結果について、出力先に残っている前回の JSON (Terrestrial.json / BS.json / CS.json)
+    と今回のスキャン結果の差分レポートを生成し、差分があれば表示 + `<band_label>.diff.txt` に保存する
+    (CATV.diff.txt と同じ流儀: 前回 JSON の読み込み・diff 生成は JSON を上書きする前に呼ぶこと。壊れた JSON でも
+     この後の JSON 保存を巻き添えにしないよう try/except で保護し、差分なし ('') のときは何もしない)
+
+    Args:
+        output_dir (Path): 出力先ディレクトリ (絶対パス)
+        band_label (str): 放送帯域名 ('Terrestrial' / 'BS' / 'CS')。JSON/diff ファイル名にもそのまま使う
+        current_ts_infos (list[TransportStreamInfo]): 今回のスキャン結果
+        no_diff (bool): True の場合は差分レポートを生成しない
+    """
+
+    if no_diff is True:
+        return
+    json_path = output_dir / f'{band_label}.json'
+    if not json_path.is_file():
+        return
+    try:
+        previous_scan_result = json.loads(json_path.read_text(encoding='utf-8'))
+        diff_report = BuildNativeScanDiffReport(previous_scan_result, current_ts_infos, band_label)
+    except Exception as ex:
+        print(f'[yellow]Failed to generate the {band_label} scan diff report: {type(ex).__name__}: {ex}[/yellow]')
+        print(f'[yellow]The previous {band_label}.json may be corrupted or in an old format. Skipping the diff report.[/yellow]')
+        return
+    if diff_report == '':
+        return
+    print(Rule(characters='-', style=Style(color='#E33157')))
+    print(f'[bright_blue]{band_label} Scan Diff Report (compared to the previous {band_label}.json)[/bright_blue]')
+    # レポートはプレーンテキストだが、サービス名などに "[" を含む値が rich マークアップとして誤解釈されないよう escape() を通す
+    print(escape(diff_report))
+    (output_dir / f'{band_label}.diff.txt').write_text(diff_report, encoding='utf-8')
+
+
+def _WriteRecorderConfigs(
+    output_dir: Path,
+    carriers: list[CATVCarrierInfo],
+    catv_tuners: list[CATVTuner],
+    isdbt_tuners: list[ISDBTuner],
+    isdbs_tuners: list[ISDBTuner],
+    formatter_kwargs: dict,
+    warn_when_no_catv_tuner: bool = False,
+) -> None:
+    """
+    レコーダー (Mirakurun/mirakc) 向けのチャンネル設定 (channels_catv.yml) / チューナー設定 (tuners_catv.yml) と、
+    EDCB (EDCB-Wine) 向けの ChSet4/ChSet5 テキストを出力する。通常スキャン時と --from-json 再フォーマット時で共用する
+
+    Args:
+        output_dir (Path): 出力先ディレクトリ (絶対パス)
+        carriers (list[CATVCarrierInfo]): CATV キャリア情報のリスト
+        catv_tuners (list[CATVTuner]): tuners_catv.yml に列挙する CATV チューナー (今回スキャンに使った/ライブ検出したもの)
+        isdbt_tuners (list[ISDBTuner]): tuners_catv.yml に列挙する ISDB-T チューナー (未検出なら空リスト)
+        isdbs_tuners (list[ISDBTuner]): tuners_catv.yml に列挙する ISDB-S チューナー (未検出なら空リスト)
+        formatter_kwargs (dict): channels/EDCB フォーマッターに渡す共通キーワード引数 (_BuildFormatterKwargs() の戻り値)
+        warn_when_no_catv_tuner (bool): CATV チューナーが 0 台のとき tuners_catv.yml をスキップした旨を黄警告するか
+    """
+
+    # Mirakurun/mirakc 向けチャンネル設定 (CATV 分 + ネイティブ地上波/BS/CS 分)
+    mirakurun_dir = output_dir / 'Mirakurun'
+    mirakurun_dir.mkdir(parents=True, exist_ok=True)
+    CATVMirakurunChannelsYmlFormatter(mirakurun_dir / 'channels_catv.yml', carriers, **formatter_kwargs).save()
+
+    mirakc_dir = output_dir / 'mirakc'
+    mirakc_dir.mkdir(parents=True, exist_ok=True)
+    CATVMirakcConfigYmlFormatter(mirakc_dir / 'channels_catv.yml', carriers, **formatter_kwargs).save()
+
+    # EDCB (EDCB-Wine) 向けの ChSet4/ChSet5 テキスト (実機検証未了の実験的出力)
+    # ネイティブスキャナ (EDCB-Wine の BonDriver_mirakc) の命名に倣い BonDriver_mirakc(BonDriver_mirakc).ChSet4.txt / ChSet5.txt を出力する
+    edcb_dir = output_dir / 'EDCB-Wine'
+    edcb_dir.mkdir(parents=True, exist_ok=True)
+    CATVEDCBChSet4TxtFormatter(edcb_dir / 'BonDriver_mirakc(BonDriver_mirakc).ChSet4.txt', carriers, **formatter_kwargs).save()
+    CATVEDCBChSet5TxtFormatter(edcb_dir / 'ChSet5.txt', carriers, **formatter_kwargs).save()
+
+    # チューナー設定 (tuners_catv.yml): channels 側に実際に出力される CATV エントリの type 集合を CATV チューナーの types に列挙する
+    if len(catv_tuners) == 0:
+        if warn_when_no_catv_tuner is True:
+            print('[yellow]No CATV tuner found. Skipping tuners_catv.yml generation.[/yellow]')
+        return
+    catv_channel_types = GetEmittedCATVChannelTypes(
+        carriers,
+        exclude_pay_tv=formatter_kwargs['exclude_pay_tv'],
+        bcas_only=formatter_kwargs['bcas_only'],
+        cas_as_sky=formatter_kwargs['cas_as_sky'],
+        prefer=formatter_kwargs['prefer'],
+        tr_ts_infos=formatter_kwargs['tr_ts_infos'],
+        bs_ts_infos=formatter_kwargs['bs_ts_infos'],
+        cs_ts_infos=formatter_kwargs['cs_ts_infos'],
+    )
+    dvbv5_conf_path = output_dir / 'dvbv5_channels_catv.conf'
+    CATVMirakurunTunersYmlFormatter(
+        mirakurun_dir / 'tuners_catv.yml', catv_tuners, isdbt_tuners, isdbs_tuners, dvbv5_conf_path, catv_channel_types
+    ).save()
+    CATVMirakcTunersYmlFormatter(
+        mirakc_dir / 'tuners_catv.yml', catv_tuners, isdbt_tuners, isdbs_tuners, dvbv5_conf_path, catv_channel_types
+    ).save()
+
+
+def _ReformatFromJson(
+    output_dir: Path,
+    exclude_pay_tv: bool,
+    bcas_only: bool,
+    cas_as_sky: bool,
+    prefer: PreferredSource | None,
+    normalize_names: bool,
+    lnb: LNBVoltage,
+    output_recisdb_log: bool,
+) -> None:
+    """
+    --from-json 再フォーマットモード: チューナー検出もスキャンも行わず、出力先に既存の JSON (CATV.json 必須 +
+    Terrestrial.json / BS.json / CS.json は任意) だけを読み込んで、出力ファイル群 (dvbv5 conf / Mirakurun・mirakc の
+    channels/tuners / EDCB) を再生成する。JSON 群と diff は再生成しない (読み取り専用)
+
+    Args:
+        output_dir (Path): 既存 JSON を読み込む出力先ディレクトリ
+        exclude_pay_tv / bcas_only / cas_as_sky / prefer / normalize_names: 出力系オプション (channels/EDCB へ受け渡す)
+        lnb (LNBVoltage): tuners 生成用のライブチューナー検出時の LNB 給電電圧
+        output_recisdb_log (bool): tuners 生成用のライブチューナー検出時に recisdb ログを出力するか
+    """
+
+    output_dir = output_dir.resolve()
+
+    # CATV.json は必須。読めない/存在しない場合は赤エラーで終了する
+    catv_json_path = output_dir / 'CATV.json'
+    if not catv_json_path.is_file():
+        print(f'[red]CATV.json was not found in {output_dir}. --from-json requires an existing CATV.json.[/red]')
+        print(Rule(characters='=', style=Style(color='#E33157')))
+        raise typer.Exit(code=1)
+    try:
+        catv_json = json.loads(catv_json_path.read_text(encoding='utf-8'))
+        carriers = [CATVCarrierInfo.model_validate(value) for value in catv_json.values()]
+    except Exception as ex:
+        print(f'[red]Failed to read or parse CATV.json: {type(ex).__name__}: {ex}[/red]')
+        print(Rule(characters='=', style=Style(color='#E33157')))
+        raise typer.Exit(code=1) from ex
+    carriers = sorted(carriers, key=lambda carrier: carrier.physical_channel)
+
+    # Terrestrial.json / BS.json / CS.json は存在すれば復元し、無ければ空扱いにする
+    def _LoadNativeJson(file_name: str) -> list[TransportStreamInfo]:
+        json_path = output_dir / file_name
+        if not json_path.is_file():
+            return []
+        try:
+            entries = json.loads(json_path.read_text(encoding='utf-8'))
+            return [TransportStreamInfo.model_validate(entry) for entry in entries]
+        except Exception as ex:
+            print(f'[yellow]Failed to read {file_name}: {type(ex).__name__}: {ex}. Ignoring it.[/yellow]')
+            return []
+
+    tr_ts_infos = _LoadNativeJson('Terrestrial.json')
+    bs_ts_infos = _LoadNativeJson('BS.json')
+    cs_ts_infos = _LoadNativeJson('CS.json')
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # dvbv5 conf を再生成 (tuners が参照するため channels より先に生成する)
+    CATVDvbv5ConfFormatter(output_dir / 'dvbv5_channels_catv.conf', carriers).save()
+
+    # tuners 生成用のチューナー情報はベストエフォートでライブ検出する (見つからなくても exit しない)
+    catv_tuners = CATVTuner.getAvailableCATVTuners(output_recisdb_log=output_recisdb_log)
+    isdbt_tuners: list[ISDBTuner] = []
+    isdbs_tuners: list[ISDBTuner] = []
+    if shutil.which('recisdb') is not None:
+        isdbt_tuners = ISDBTuner.getAvailableISDBTTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
+        isdbs_tuners = ISDBTuner.getAvailableISDBSTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
+
+    formatter_kwargs = _BuildFormatterKwargs(
+        tr_ts_infos, bs_ts_infos, cs_ts_infos, exclude_pay_tv, bcas_only, cas_as_sky, prefer, normalize_names
+    )
+    _WriteRecorderConfigs(
+        output_dir, carriers, catv_tuners, isdbt_tuners, isdbs_tuners, formatter_kwargs, warn_when_no_catv_tuner=True
+    )
+
+    print(Rule(characters='=', style=Style(color='#E33157')))
+    print('Reformatted from existing JSON.')
+    print(
+        f'CATV: {len(carriers)} carrier(s) / Terrestrial: {len(tr_ts_infos)} TS / '
+        f'BS: {len(bs_ts_infos)} TS / CS: {len(cs_ts_infos)} TS'
+    )
+    print(Rule(characters='=', style=Style(color='#E33157')))
+
+
 @app.command(
     help='isdb-catv-scanner: Scans Japanese CATV transmodulation channels (via dvbv5-zap) '
     'and outputs the results as CATV.json / a dvbv5 conf file.'
@@ -201,6 +432,61 @@ def main(
         '--no-diff',
         help='Disable the scan diff report against the existing CATV.json in the output directory.',
     ),
+    satellite: bool = typer.Option(
+        False,
+        '--satellite/--no-satellite',
+        help='Also scan native BS/CS (ISDB-S) channels with recisdb and merge them into the recorder configs '
+        '(default: disabled). Skipped with a warning when no ISDB-S tuner (or recisdb) is available.',
+    ),
+    terrestrial: bool = typer.Option(
+        False,
+        '--terrestrial/--no-terrestrial',
+        help='Also scan native terrestrial (ISDB-T) channels with recisdb and merge them into the recorder configs '
+        '(default: disabled). Skipped with a warning when no ISDB-T tuner (or recisdb) is available.',
+    ),
+    exclude_pay_tv: bool = typer.Option(
+        False,
+        '--exclude-pay-tv',
+        help='Exclude pay-TV channels from the Mirakurun/mirakc channel configs (both CATV and native BS/CS entries). '
+        'Also skips the native CS scan when --satellite is set. JSON outputs always include all channels.',
+    ),
+    bcas_only: bool = typer.Option(
+        False,
+        '--bcas-only',
+        help='Limit the Mirakurun/mirakc channel configs to CATV channels receivable with a B-CAS card '
+        '(excludes channels that require C-CAS/A-CAS or have an unknown CAS). JSON outputs always include all channels.',
+    ),
+    cas_as_sky: bool = typer.Option(
+        False,
+        '--cas-as-sky',
+        help='Output CATV channels that require C-CAS/A-CAS as "type: SKY" in the Mirakurun/mirakc channel configs.',
+    ),
+    prefer: PreferredSource | None = typer.Option(
+        None,
+        '--prefer',
+        help='When a CATV-retransmitted TS and a native (recisdb) TS point to the same TS, keep the specified side '
+        'enabled and mark the other as disabled in the recorder configs ("catv" or "native"). Default: keep both.',
+    ),
+    normalize_names: bool = typer.Option(
+        False,
+        '--normalize-names',
+        help='Normalize full-width alphanumerics/symbols in channel names to half-width in the recorder configs.',
+    ),
+    from_json: bool = typer.Option(
+        False,
+        '--from-json',
+        help='Reformat mode: skip tuner detection and scanning, and regenerate the output files (dvbv5 conf, '
+        'Mirakurun/mirakc channels & tuners, EDCB) from the existing JSON in the output directory. Requires CATV.json. '
+        'JSON outputs and diff reports are not regenerated. Scan-related options (--channels/--adapter/--adapters/'
+        '--parallel/--recording-time/--satellite/--terrestrial etc.) are ignored; only output options '
+        '(--exclude-pay-tv/--bcas-only/--cas-as-sky/--prefer/--normalize-names/--no-diff) take effect.',
+    ),
+    lnb: LNBVoltage = typer.Option(
+        LNBVoltage.LOW, '--lnb', help='LNB voltage for satellite antenna power supply (native BS/CS scan only).'
+    ),
+    output_recisdb_log: bool = typer.Option(
+        False, '--output-recisdb-log', help='Output recisdb log to stderr (native BS/CS/terrestrial scan only).'
+    ),
 ):
     print(
         Rule(
@@ -210,6 +496,11 @@ def main(
             align='center',
         )
     )
+
+    # --from-json (再フォーマットモード): チューナー検出もスキャンも行わず、既存 JSON から出力ファイル群だけを再生成する
+    if from_json is True:
+        _ReformatFromJson(output_dir, exclude_pay_tv, bcas_only, cas_as_sky, prefer, normalize_names, lnb, output_recisdb_log)
+        return
 
     # 利用可能な CATV (DVB-C ANNEX_A) 対応チューナーを検出
     tuners = CATVTuner.getAvailableCATVTuners(output_recisdb_log=output_dvbv5_zap_log)
@@ -221,6 +512,16 @@ def main(
             print(f'  [green]{tuner.name}[/green] (adapter{tuner.adapter_number}/frontend{tuner.frontend_number})')
         if len(tuners) == 0:
             print('[yellow]No CATV-capable tuner found.[/yellow]')
+        print(Rule(characters='=', style=Style(color='#E33157')))
+        print('[bright_blue]Available ISDB-S tuners (for native BS/CS scan):[/bright_blue]')
+        isdbs_tuners = ISDBTuner.getAvailableISDBSTuners()
+        for isdbs_tuner in isdbs_tuners:
+            print(
+                f'  [{isdbs_tuner.device_type}] [green]{isdbs_tuner.name}[/green] ({isdbs_tuner.device_path}) '
+                f'{"(Busy)" if isdbs_tuner.isBusy() else ""}'
+            )
+        if len(isdbs_tuners) == 0:
+            print('[yellow]No ISDB-S tuner found.[/yellow]')
         print(Rule(characters='=', style=Style(color='#E33157')))
         return
 
@@ -278,6 +579,32 @@ def main(
         print('Using tuners:')
         for tuner in scan_tuners:
             print(f'  [green]{tuner.name}[/green] (adapter{tuner.adapter_number}/frontend{tuner.frontend_number})')
+
+    # ネイティブ BS/CS (ISDB-S) スキャンに使うチューナーを CATV スキャン開始前に検出しておく
+    # (recisdb や ISDB-S チューナーがない場合でも CATV スキャン自体は続行し、衛星スキャンだけをスキップする)
+    satellite_tuners: list[ISDBTuner] = []
+    if satellite is True:
+        if shutil.which('recisdb') is None:
+            print('[yellow]recisdb not found. Skipping native BS/CS (satellite) scan.[/yellow]')
+            satellite = False
+        else:
+            satellite_tuners = ISDBTuner.getAvailableISDBSTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
+            if len(satellite_tuners) == 0:
+                print('[yellow]No ISDB-S tuner found. Skipping native BS/CS (satellite) scan.[/yellow]')
+                satellite = False
+
+    # ネイティブ地上波 (ISDB-T) スキャンに使うチューナーも CATV スキャン開始前に検出しておく (衛星と同じ扱い)
+    # (recisdb や ISDB-T チューナーがない場合でも CATV スキャン自体は続行し、地上波スキャンだけをスキップする)
+    terrestrial_tuners: list[ISDBTuner] = []
+    if terrestrial is True:
+        if shutil.which('recisdb') is None:
+            print('[yellow]recisdb not found. Skipping native terrestrial (ISDB-T) scan.[/yellow]')
+            terrestrial = False
+        else:
+            terrestrial_tuners = ISDBTuner.getAvailableISDBTTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
+            if len(terrestrial_tuners) == 0:
+                print('[yellow]No ISDB-T tuner found. Skipping native terrestrial (ISDB-T) scan.[/yellow]')
+                terrestrial = False
 
     # スキャン対象の物理チャンネルを決定
     if channels is not None:
@@ -342,6 +669,39 @@ def main(
     for adapter_number in dead_adapters:
         print(f'[yellow]adapter{adapter_number} became unavailable during the scan (the remaining tuner(s) completed it).[/yellow]')
 
+    # ***** ネイティブ地上波 (ISDB-T) のチャンネルスキャン *****
+    ## CATV スキャン (dvbv5-zap / DVB-C) とはチューナーも選局手段 (recisdb) も別系統のため、CATV スキャン完了後に直列で実行する
+    ## (衛星より先に実行する: 実行順は CATV → 地上波 → 衛星)
+    tr_ts_infos: list[TransportStreamInfo] = []
+    terrestrial_scanned = False
+    if terrestrial is True:
+        print(Rule(characters='=', style=Style(color='#E33157')))
+        print('Scanning native ISDB-T (Terrestrial) channels...')
+        print(Rule(characters='-', style=Style(color='#E33157')))
+        for terrestrial_tuner in terrestrial_tuners:
+            print(f'Found Tuner: [green]{terrestrial_tuner.name}[/green] ({terrestrial_tuner.device_path})')
+        tr_ts_infos = ScanTerrestrialChannels(terrestrial_tuners)
+        terrestrial_scanned = True
+        if len(tr_ts_infos) == 0:
+            print('[yellow]No terrestrial transport stream could be received. Check the antenna cable connection.[/yellow]')
+
+    # ***** ネイティブ BS/CS (ISDB-S) のチャンネルスキャン *****
+    ## CATV スキャン (dvbv5-zap / DVB-C) とはチューナーも選局手段 (recisdb) も別系統のため、CATV スキャン完了後に直列で実行する
+    ## (スキャン対象は BS01/TS0 + ND02 + ND04 の最大 3 チャンネルのみなので、直列でも所要時間は 40 秒程度で済む)
+    bs_ts_infos: list[TransportStreamInfo] = []
+    cs_ts_infos: list[TransportStreamInfo] = []
+    satellite_scanned = False
+    if satellite is True:
+        print(Rule(characters='=', style=Style(color='#E33157')))
+        print('Scanning native ISDB-S (Satellite) channels...')
+        print(Rule(characters='-', style=Style(color='#E33157')))
+        for satellite_tuner in satellite_tuners:
+            print(f'Found Tuner: [green]{satellite_tuner.name}[/green] ({satellite_tuner.device_path})')
+        bs_ts_infos, cs_ts_infos = ScanSatelliteChannels(satellite_tuners, exclude_pay_tv)
+        satellite_scanned = True
+        if len(bs_ts_infos) == 0:
+            print('[yellow]No BS transport stream could be received. Check the antenna cable and LNB power supply (--lnb).[/yellow]')
+
     # 出力先ディレクトリがなければ作成 (事前に絶対パスに変換しておく)
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -380,19 +740,56 @@ def main(
     CATVJSONFormatter(catv_json_path, carriers).save()
     CATVDvbv5ConfFormatter(output_dir / 'dvbv5_channels_catv.conf', carriers).save()
 
-    # レコーダー (Mirakurun/mirakc) 向けのチャンネル設定もあわせて出力する
-    mirakurun_dir = output_dir / 'Mirakurun'
-    mirakurun_dir.mkdir(parents=True, exist_ok=True)
-    CATVMirakurunChannelsYmlFormatter(mirakurun_dir / 'channels_catv.yml', carriers).save()
+    # ネイティブ地上波/BS/CS のスキャンを実行した場合は、その解析結果も JSON として出力する
+    # (既存の isdb-scanner の慣習に合わせ、JSON のみ --exclude-pay-tv の指定に関わらず取得できた全チャンネルを出力する)
+    # 前回の JSON が残っていれば、上書きする前にネイティブスキャン差分レポート (Terrestrial/BS/CS.diff.txt) を生成する
+    if terrestrial_scanned is True:
+        _EmitNativeScanDiff(output_dir, 'Terrestrial', tr_ts_infos, no_diff)
+        NativeJSONFormatter(output_dir / 'Terrestrial.json', tr_ts_infos).save()
+    if satellite_scanned is True:
+        _EmitNativeScanDiff(output_dir, 'BS', bs_ts_infos, no_diff)
+        NativeJSONFormatter(output_dir / 'BS.json', bs_ts_infos).save()
+        if exclude_pay_tv is False:
+            _EmitNativeScanDiff(output_dir, 'CS', cs_ts_infos, no_diff)
+            NativeJSONFormatter(output_dir / 'CS.json', cs_ts_infos).save()
 
-    mirakc_dir = output_dir / 'mirakc'
-    mirakc_dir.mkdir(parents=True, exist_ok=True)
-    CATVMirakcConfigYmlFormatter(mirakc_dir / 'channels_catv.yml', carriers).save()
+    # レコーダー (Mirakurun/mirakc) 向けのチャンネル設定・チューナー設定・EDCB 出力もあわせて出力する
+    # (ネイティブ地上波/BS/CS のスキャンを実行した場合は、CATV 分に加えてそのチャンネルエントリも統合して出力される)
+    formatter_kwargs = _BuildFormatterKwargs(
+        tr_ts_infos, bs_ts_infos, cs_ts_infos, exclude_pay_tv, bcas_only, cas_as_sky, prefer, normalize_names
+    )
+    _WriteRecorderConfigs(
+        output_dir, carriers, scan_tuners, terrestrial_tuners, satellite_tuners, formatter_kwargs
+    )
+
+    # ネイティブスキャンと CATV 再送信の同一放送種別 (地上波/BS/CS) チャンネルを併用すると、レコーダー設定上どちらも
+    # type: GR / type: BS / type: CS になり、チューナー (dvbv5-zap / recisdb) の振り分けを type だけでは区別できないため、
+    # 該当する場合は注意を促す (--prefer 未指定時のみ。--prefer 指定時は重複エントリが自動で isDisabled/disabled になる)
+    overlap_sources: set[str] = set()
+    if terrestrial_scanned is True:
+        overlap_sources.add('Terrestrial')
+    if satellite_scanned is True:
+        overlap_sources.update({'BS', 'CS'})
+    if prefer is None and any(
+        ts_info.retransmission_source in overlap_sources
+        for carrier in carriers
+        for ts_info in carrier.transport_streams
+    ):
+        print(
+            '[yellow]Both native and CATV-retransmitted channels of the same broadcast type (GR/BS/CS) were found. '
+            'They share the same channel type in the recorder configs, so Mirakurun/mirakc cannot distinguish '
+            'which tuner (dvbv5-zap / recisdb) to use. Pass --prefer catv or --prefer native to auto-adjust '
+            '(the non-preferred duplicate entries are marked as disabled), or disable one of them manually.[/yellow]'
+        )
 
     receivable_carrier_count = len([carrier for carrier in carriers if carrier.carrier_type.value != 'Empty'])
     print(Rule(characters='=', style=Style(color='#E33157')))
     print(f'Finished in {time.time() - scan_start_time:.2f} seconds.')
     print(f'Scanned {len(carriers)} / {len(target_channels)} channel(s). ({receivable_carrier_count} receivable)')
+    if terrestrial_scanned is True:
+        print(f'Scanned terrestrial: {len(tr_ts_infos)} TS')
+    if satellite_scanned is True:
+        print(f'Scanned satellite: BS={len(bs_ts_infos)} TS / CS={len(cs_ts_infos)} TS')
     print(Rule(characters='=', style=Style(color='#E33157')))
 
 

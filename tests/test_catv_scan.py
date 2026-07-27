@@ -6,12 +6,15 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from isdb_scanner.catv.formatter import CATVJSONFormatter, NativeJSONFormatter
 from isdb_scanner.catv.scan import app
 from isdb_scanner.catv.tuner import CATVTuner
-from isdb_scanner.tuner import TunerOpeningError
+from isdb_scanner.constants import ServiceInfo, TransportStreamInfo
+from isdb_scanner.tuner import ISDBTuner, TunerOpeningError
 
 # 実機 (dvbv5-zap) には依存せず、PATH 上に設置した偽の dvbv5-zap でスキャンを検証するためのソースを流用する
 # (このモジュール内のフィクスチャは実機・受信環境に一切依存しない合成データのみで構成されている)
+from tests.test_catv_formatter import BuildSyntheticBSTsInfos, BuildSyntheticCarriers, BuildSyntheticCSTsInfos
 from tests.test_catv_tuner import FAKE_DVBV5_ZAP_SOURCE
 
 
@@ -88,6 +91,7 @@ class TestScanParallelIntegration:
                 '0.5',
                 '--no-collect-signal-stats',
                 '--no-diff',
+                '--no-satellite',
             ],
         )
 
@@ -138,6 +142,7 @@ class TestScanTunerFailover:
                 '0.5',
                 '--no-collect-signal-stats',
                 '--no-diff',
+                '--no-satellite',
             ],
         )
 
@@ -163,6 +168,7 @@ class TestScanTunerFailover:
                 '0.5',
                 '--no-collect-signal-stats',
                 '--no-diff',
+                '--no-satellite',
             ],
         )
 
@@ -189,6 +195,7 @@ class TestScanDefaultAndNoParallel:
                 '0.5',
                 '--no-collect-signal-stats',
                 '--no-diff',
+                '--no-satellite',
             ],
         )
 
@@ -216,6 +223,7 @@ class TestScanDefaultAndNoParallel:
                 '0.5',
                 '--no-collect-signal-stats',
                 '--no-diff',
+                '--no-satellite',
             ],
         )
 
@@ -228,3 +236,384 @@ class TestScanDefaultAndNoParallel:
         catv_json = json.loads((output_dir / 'CATV.json').read_text(encoding='utf-8'))
         assert list(catv_json.keys()) == ['CATV_15', 'CATV_16']
         assert FAKE_TIMEOUT_CHANNEL not in catv_json
+
+class FakeISDBSTuner:
+    """
+    ネイティブ BS/CS/地上波スキャン用の偽 ISDB チューナー (tune() の呼び出しを記録し、ダミーの TS データを返す)
+    tuners_catv.yml 生成時に recisdb 選局コマンドの組み立てで参照される type / isTSIDSelectionSupported() / device_path も備える
+    (地上波スキャン用にも流用するため、tuner_type は初期化引数で切り替えられる)
+    """
+
+    def __init__(self, tuner_type: str = 'ISDB-S', name: str = 'Fake ISDB-S Tuner') -> None:
+        self.name = name
+        self.type = tuner_type
+        self.device_path = Path('/dev/fake-isdbs0')
+        self.last_tuner_opening_failed = False
+        self.tuned_channels: list[str] = []
+
+    def isTSIDSelectionSupported(self) -> bool:
+        return True
+
+    def tune(self, physical_channel_recisdb: str, recording_time: float = 10.0, tune_timeout: float = 7.0) -> bytearray:
+        self.tuned_channels.append(physical_channel_recisdb)
+        return bytearray(b'fake ts stream data')
+
+
+class _FakeTransportStreamAnalyzer:
+    """偽の TransportStreamAnalyzer (物理チャンネルに応じた合成 TransportStreamInfo を返す)"""
+
+    def __init__(self, ts_stream_data: bytearray, physical_channel: str) -> None:
+        self._physical_channel = physical_channel
+
+    def analyze(self) -> list[TransportStreamInfo]:
+        if self._physical_channel == 'BS01/TS0':
+            return BuildSyntheticBSTsInfos()
+        if self._physical_channel == 'ND02':
+            return [ts_info for ts_info in BuildSyntheticCSTsInfos() if ts_info.physical_channel == 'ND02']
+        if self._physical_channel == 'ND04':
+            return [ts_info for ts_info in BuildSyntheticCSTsInfos() if ts_info.physical_channel == 'ND04']
+        raise AssertionError(f'Unexpected physical channel: {self._physical_channel}')
+
+
+@pytest.fixture
+def fake_recisdb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """PATH 上に偽の recisdb コマンドを設置する (shutil.which('recisdb') のチェックを通すためだけで、実行はされない)"""
+
+    script_path = tmp_path / 'recisdb'
+    script_path.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv('PATH', f'{tmp_path}{os.pathsep}{os.environ.get("PATH", "")}')
+    return script_path
+
+
+def PatchSatelliteScan(monkeypatch: pytest.MonkeyPatch, isdbs_tuners: list[FakeISDBSTuner]) -> None:
+    """ISDBTuner.getAvailableISDBSTuners() と衛星スキャン用の TransportStreamAnalyzer を合成実装に差し替える"""
+
+    monkeypatch.setattr(ISDBTuner, 'getAvailableISDBSTuners', lambda **kwargs: isdbs_tuners)
+    monkeypatch.setattr('isdb_scanner.catv.satellite.TransportStreamAnalyzer', _FakeTransportStreamAnalyzer)
+
+
+class TestScanSatelliteIntegration:
+    """ネイティブ BS/CS (ISDB-S) スキャン統合の CLI テスト (偽 recisdb + 偽 ISDB-S チューナーによる合成データのみで構成)"""
+
+    BASE_ARGS = ['--channels', 'CATV_15,CATV_16', '--recording-time', '0.5', '--no-collect-signal-stats', '--no-diff']
+    SATELLITE_ARGS = [*BASE_ARGS, '--satellite']
+
+    def test_satellite_disabled_by_default(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        # --satellite を指定しない限り、ネイティブ BS/CS スキャンは実行されない (デフォルト無効)
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        fake_isdbs_tuner = FakeISDBSTuner()
+        PatchSatelliteScan(monkeypatch, [fake_isdbs_tuner])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), *self.BASE_ARGS])
+
+        assert result.exit_code == 0, result.output
+        assert fake_isdbs_tuner.tuned_channels == []
+        assert not (output_dir / 'BS.json').is_file()
+        assert 'Scanned satellite:' not in result.output
+
+    def test_satellite_scan_with_flag(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        fake_isdbs_tuner = FakeISDBSTuner()
+        PatchSatelliteScan(monkeypatch, [fake_isdbs_tuner])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), *self.SATELLITE_ARGS])
+
+        assert result.exit_code == 0, result.output
+        # BS01/TS0 (BS) → ND02 (CS1) → ND04 (CS2) の順で recisdb 互換の物理チャンネル表記で選局されること
+        assert fake_isdbs_tuner.tuned_channels == ['BS01_0', 'CS02', 'CS04']
+        assert 'Scanned satellite: BS=2 TS / CS=2 TS' in result.output
+
+        # BS.json / CS.json が生成されること
+        bs_json = json.loads((output_dir / 'BS.json').read_text(encoding='utf-8'))
+        assert [ts_info['physical_channel'] for ts_info in bs_json] == ['BS01/TS0', 'BS03/TS1']
+        cs_json = json.loads((output_dir / 'CS.json').read_text(encoding='utf-8'))
+        assert [ts_info['physical_channel'] for ts_info in cs_json] == ['ND02', 'ND04']
+
+        # Mirakurun / mirakc のチャンネル設定に BS/CS エントリが統合されること
+        mirakurun_yml = (output_dir / 'Mirakurun' / 'channels_catv.yml').read_text(encoding='utf-8')
+        assert 'type: BS' in mirakurun_yml
+        assert 'type: CS' in mirakurun_yml
+        assert "satellite: ' --tsid 16400 '" in mirakurun_yml
+        mirakc_yml = (output_dir / 'mirakc' / 'channels_catv.yml').read_text(encoding='utf-8')
+        assert 'extra-args: --tsid 16400' in mirakc_yml
+        assert 'channel: CS04' in mirakc_yml
+
+    def test_no_satellite_flag_disables_scan(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        fake_isdbs_tuner = FakeISDBSTuner()
+        PatchSatelliteScan(monkeypatch, [fake_isdbs_tuner])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), *self.BASE_ARGS, '--no-satellite'])
+
+        assert result.exit_code == 0, result.output
+        assert fake_isdbs_tuner.tuned_channels == []
+        assert not (output_dir / 'BS.json').is_file()
+        assert not (output_dir / 'CS.json').is_file()
+        assert 'Scanned satellite:' not in result.output
+        # Mirakurun / mirakc のチャンネル設定にも BS/CS エントリが含まれないこと (ヘッダーコメント行は判定から除く)
+        mirakurun_yml = (output_dir / 'Mirakurun' / 'channels_catv.yml').read_text(encoding='utf-8')
+        mirakurun_yml_body = '\n'.join(line for line in mirakurun_yml.splitlines() if not line.lstrip().startswith('#'))
+        assert 'type: BS' not in mirakurun_yml_body
+        assert 'recisdb' not in mirakurun_yml_body
+
+    def test_no_isdbs_tuner_skips_satellite_scan(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        PatchSatelliteScan(monkeypatch, [])  # ISDB-S チューナーが 1 台も見つからない
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), *self.SATELLITE_ARGS])
+
+        assert result.exit_code == 0, result.output
+        assert 'No ISDB-S tuner found. Skipping native BS/CS (satellite) scan.' in result.output
+        assert not (output_dir / 'BS.json').is_file()
+        # CATV スキャン自体は完走すること
+        assert (output_dir / 'CATV.json').is_file()
+
+    def test_missing_recisdb_skips_satellite_scan(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        fake_isdbs_tuner = FakeISDBSTuner()
+        PatchSatelliteScan(monkeypatch, [fake_isdbs_tuner])
+        # PATH を偽 dvbv5-zap のあるディレクトリのみに差し替え、recisdb が見つからない状況を作る
+        monkeypatch.setenv('PATH', str(fake_dvbv5_zap.parent))
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), *self.SATELLITE_ARGS])
+
+        assert result.exit_code == 0, result.output
+        assert 'recisdb not found. Skipping native BS/CS (satellite) scan.' in result.output
+        assert fake_isdbs_tuner.tuned_channels == []
+        assert not (output_dir / 'BS.json').is_file()
+        assert (output_dir / 'CATV.json').is_file()
+
+    def test_exclude_pay_tv_skips_cs_scan(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        fake_isdbs_tuner = FakeISDBSTuner()
+        PatchSatelliteScan(monkeypatch, [fake_isdbs_tuner])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), *self.SATELLITE_ARGS, '--exclude-pay-tv'])
+
+        assert result.exit_code == 0, result.output
+        # CS (ND02/ND04) はスキャンされないこと
+        assert fake_isdbs_tuner.tuned_channels == ['BS01_0']
+        # BS.json は生成されるが CS.json は生成されないこと (JSON は常に全チャンネル出力の慣習通り有料 BS も含む)
+        bs_json = json.loads((output_dir / 'BS.json').read_text(encoding='utf-8'))
+        assert [ts_info['physical_channel'] for ts_info in bs_json] == ['BS01/TS0', 'BS03/TS1']
+        assert not (output_dir / 'CS.json').is_file()
+        # YAML では有料放送のみの BS03/TS1 と CS エントリが除外されること (ヘッダーコメント行は判定から除く)
+        mirakurun_yml = (output_dir / 'Mirakurun' / 'channels_catv.yml').read_text(encoding='utf-8')
+        mirakurun_yml_body = '\n'.join(line for line in mirakurun_yml.splitlines() if not line.lstrip().startswith('#'))
+        assert 'BS01/TS0' in mirakurun_yml_body
+        assert 'BS03/TS1' not in mirakurun_yml_body
+        assert 'type: CS' not in mirakurun_yml_body
+
+
+def BuildSyntheticTerrestrialTsInfos() -> list[TransportStreamInfo]:
+    """ネイティブ地上波統合出力のテスト用に、合成の地上波 TransportStreamInfo (物理チャンネル T27) を組み立てる"""
+
+    return [
+        TransportStreamInfo(
+            physical_channel='T27',
+            transport_stream_id=0x7810,
+            network_id=0x7880,  # 地上波の network_id レンジ (0x7880-0x7FE8)
+            network_name='NHK総合',
+            remote_control_key_id=1,
+            services=[
+                ServiceInfo(channel_number='011', service_id=1024, service_type=0x01, service_name='NHK総合1', is_free=True),
+            ],
+        ),
+    ]
+
+
+class _FakeTerrestrialTransportStreamAnalyzer:
+    """偽の地上波用 TransportStreamAnalyzer (物理チャンネル T27 でのみ合成 TS を返し、それ以外は空を返す)"""
+
+    def __init__(self, ts_stream_data: bytearray, physical_channel: str) -> None:
+        self._physical_channel = physical_channel
+
+    def analyze(self) -> list[TransportStreamInfo]:
+        if self._physical_channel == 'T27':
+            return BuildSyntheticTerrestrialTsInfos()
+        return []
+
+
+def PatchTerrestrialScan(monkeypatch: pytest.MonkeyPatch, isdbt_tuners: list[FakeISDBSTuner]) -> None:
+    """ISDBTuner.getAvailableISDBTTuners() と地上波スキャン用の TransportStreamAnalyzer を合成実装に差し替える"""
+
+    monkeypatch.setattr(ISDBTuner, 'getAvailableISDBTTuners', lambda **kwargs: isdbt_tuners)
+    monkeypatch.setattr('isdb_scanner.catv.terrestrial.TransportStreamAnalyzer', _FakeTerrestrialTransportStreamAnalyzer)
+
+
+class TestScanTerrestrialIntegration:
+    """ネイティブ地上波 (ISDB-T) スキャン統合の CLI テスト (偽 recisdb + 偽 ISDB-T チューナーによる合成データのみで構成)"""
+
+    BASE_ARGS = ['--channels', 'CATV_15,CATV_16', '--recording-time', '0.5', '--no-collect-signal-stats', '--no-diff']
+
+    def test_terrestrial_disabled_by_default(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        # --terrestrial を指定しない限り、ネイティブ地上波スキャンは実行されない (デフォルト無効)
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        fake_isdbt_tuner = FakeISDBSTuner()
+        PatchTerrestrialScan(monkeypatch, [fake_isdbt_tuner])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), *self.BASE_ARGS])
+
+        assert result.exit_code == 0, result.output
+        assert fake_isdbt_tuner.tuned_channels == []
+        assert not (output_dir / 'Terrestrial.json').is_file()
+        assert 'Scanned terrestrial:' not in result.output
+
+    def test_terrestrial_scan_with_flag(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        fake_isdbt_tuner = FakeISDBSTuner()
+        PatchTerrestrialScan(monkeypatch, [fake_isdbt_tuner])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), *self.BASE_ARGS, '--terrestrial'])
+
+        assert result.exit_code == 0, result.output
+        # T13〜T62 が recisdb 互換の物理チャンネル表記 (T13〜T62) で順に tune されること
+        assert fake_isdbt_tuner.tuned_channels == [f'T{i}' for i in range(13, 63)]
+        assert 'Scanned terrestrial: 1 TS' in result.output
+
+        # Terrestrial.json が生成され、T27 の TS が含まれること
+        terrestrial_json = json.loads((output_dir / 'Terrestrial.json').read_text(encoding='utf-8'))
+        assert [ts_info['physical_channel'] for ts_info in terrestrial_json] == ['T27']
+
+        # Mirakurun / mirakc のチャンネル設定に GR (T27) エントリが統合されること
+        mirakurun_yml = (output_dir / 'Mirakurun' / 'channels_catv.yml').read_text(encoding='utf-8')
+        assert 'type: GR' in mirakurun_yml
+        mirakc_yml = (output_dir / 'mirakc' / 'channels_catv.yml').read_text(encoding='utf-8')
+        assert 'channel: T27' in mirakc_yml
+
+    def test_tuners_yml_smoke(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        # tuners_catv.yml が生成され、CATV チューナー用の dvbv5-zap 選局コマンド行を含むこと
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        fake_isdbt_tuner = FakeISDBSTuner()
+        PatchTerrestrialScan(monkeypatch, [fake_isdbt_tuner])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(app, [str(output_dir), *self.BASE_ARGS, '--terrestrial'])
+
+        assert result.exit_code == 0, result.output
+        mirakurun_tuners = (output_dir / 'Mirakurun' / 'tuners_catv.yml').read_text(encoding='utf-8')
+        assert 'dvbv5-zap' in mirakurun_tuners
+        mirakc_tuners = (output_dir / 'mirakc' / 'tuners_catv.yml').read_text(encoding='utf-8')
+        assert 'dvbv5-zap' in mirakc_tuners
+        # ISDB-T チューナー用の recisdb 選局コマンド行も含まれること
+        assert 'recisdb' in mirakurun_tuners
+
+    def test_prefer_native_smoke(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        # --prefer native 指定時は正常終了し、type 重複の警告文言が表示されないこと
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        fake_isdbt_tuner = FakeISDBSTuner()
+        PatchTerrestrialScan(monkeypatch, [fake_isdbt_tuner])
+        PatchSatelliteScan(monkeypatch, [FakeISDBSTuner()])
+        output_dir = tmp_path / 'out'
+
+        result = runner.invoke(
+            app, [str(output_dir), *self.BASE_ARGS, '--terrestrial', '--satellite', '--prefer', 'native']
+        )
+
+        assert result.exit_code == 0, result.output
+        assert 'Both native and CATV-retransmitted channels' not in result.output
+
+
+class TestScanNativeDiff:
+    """ネイティブスキャン (BS/CS/地上波) の差分レポート出力のテスト"""
+
+    BASE_ARGS = ['--channels', 'CATV_15,CATV_16', '--recording-time', '0.5', '--no-collect-signal-stats']
+
+    def test_bs_diff_generated(
+        self, fake_dvbv5_zap: Path, fake_recisdb: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        # 前回の BS.json (BS01/TS0 のみ) を配置した状態で --satellite スキャンすると、
+        # 今回は BS03/TS1 が増えるため BS.diff.txt が生成されること (--no-diff は付けない)
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        PatchSatelliteScan(monkeypatch, [FakeISDBSTuner()])
+        output_dir = tmp_path / 'out'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 前回の BS.json = BS01/TS0 のみ (今回のスキャン結果 BS01/TS0 + BS03/TS1 との差分が生じる)
+        previous_bs = [BuildSyntheticBSTsInfos()[0]]
+        NativeJSONFormatter(output_dir / 'BS.json', previous_bs).save()
+
+        result = runner.invoke(app, [str(output_dir), *self.BASE_ARGS, '--satellite'])
+
+        assert result.exit_code == 0, result.output
+        assert (output_dir / 'BS.diff.txt').is_file()
+        diff_text = (output_dir / 'BS.diff.txt').read_text(encoding='utf-8')
+        assert 'BS03/TS1' in diff_text
+        # 上書き後の BS.json は今回のスキャン結果 (2 TS) になっていること
+        bs_json = json.loads((output_dir / 'BS.json').read_text(encoding='utf-8'))
+        assert [ts_info['physical_channel'] for ts_info in bs_json] == ['BS01/TS0', 'BS03/TS1']
+
+
+class TestScanFromJson:
+    """--from-json 再フォーマットモードのテスト (スキャンを行わず既存 JSON から出力を再生成する)"""
+
+    def test_reformat_regenerates_outputs_without_rewriting_json(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        # 合成 JSON (CATV.json + BS.json) を配置 → --from-json 実行 → 出力ファイル群が再生成され、JSON は書き換わらない
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        output_dir = tmp_path / 'out'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        CATVJSONFormatter(output_dir / 'CATV.json', BuildSyntheticCarriers()).save()
+        NativeJSONFormatter(output_dir / 'BS.json', BuildSyntheticBSTsInfos()).save()
+        catv_json_before = (output_dir / 'CATV.json').read_bytes()
+        bs_json_before = (output_dir / 'BS.json').read_bytes()
+
+        result = runner.invoke(app, [str(output_dir), '--from-json'])
+
+        assert result.exit_code == 0, result.output
+        assert 'Reformatted from existing JSON.' in result.output
+
+        # 出力ファイル群 (conf / channels / tuners / EDCB) が再生成されること
+        assert (output_dir / 'dvbv5_channels_catv.conf').is_file()
+        assert (output_dir / 'Mirakurun' / 'channels_catv.yml').is_file()
+        assert (output_dir / 'Mirakurun' / 'tuners_catv.yml').is_file()
+        assert (output_dir / 'mirakc' / 'channels_catv.yml').is_file()
+        assert (output_dir / 'mirakc' / 'tuners_catv.yml').is_file()
+        assert (output_dir / 'EDCB-Wine').is_dir()
+
+        # BS.json のエントリが channels に統合されていること (再フォーマットでも native 分が反映される)
+        assert 'type: BS' in (output_dir / 'Mirakurun' / 'channels_catv.yml').read_text(encoding='utf-8')
+
+        # JSON 群は読み取り専用: CATV.json / BS.json が書き換わらないこと
+        assert (output_dir / 'CATV.json').read_bytes() == catv_json_before
+        assert (output_dir / 'BS.json').read_bytes() == bs_json_before
+
+    def test_reformat_missing_catv_json_exits_1(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # CATV.json が存在しない場合は赤エラーで exit 1
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        output_dir = tmp_path / 'out'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        result = runner.invoke(app, [str(output_dir), '--from-json'])
+
+        assert result.exit_code == 1
+        assert 'CATV.json was not found' in result.output

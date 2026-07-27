@@ -6,16 +6,25 @@ from ruamel.yaml import YAML
 from isdb_scanner.catv.constants import (
     CATV_FREQUENCY_TABLE,
     CarrierType,
+    CASInfo,
     CATVCarrierInfo,
     CATVServiceInfo,
     CATVTransportStreamInfo,
+    PreferredSource,
 )
 from isdb_scanner.catv.formatter import (
     CATVDvbv5ConfFormatter,
     CATVJSONFormatter,
     CATVMirakcConfigYmlFormatter,
+    CATVMirakcTunersYmlFormatter,
     CATVMirakurunChannelsYmlFormatter,
+    CATVMirakurunTunersYmlFormatter,
+    GetEmittedCATVChannelTypes,
+    NativeJSONFormatter,
+    NormalizeChannelName,
+    SatelliteJSONFormatter,
 )
+from isdb_scanner.constants import ServiceInfo, TransportStreamInfo
 
 
 def LoadYaml(text: str):
@@ -211,6 +220,405 @@ class TestCATVMirakurunChannelsYmlFormatterSynthetic:
         assert save_path.read_text(encoding='utf-8') == formatted_str
 
 
+def BuildSyntheticRetransmissionCarriers() -> list[CATVCarrierInfo]:
+    """
+    type マッピング・フィルタ系テスト用に、BS/CS 再送信と CAS 種別のバリエーションを含む合成キャリア一覧を組み立てる
+    - CATV_20 (TSMF):
+      - 相対TS1: BS 再送信・B-CAS・無料 (映像 + 独立データ放送)
+      - 相対TS2: BS 再送信・B-CAS・有料 (WOWOW 型: 有料映像 + 無料独立データ放送)
+      - 相対TS3: CS 再送信・B-CAS・有料
+    - CATV_30 (SingleTS): 自主放送・C-CAS・有料
+    """
+
+    return [
+        CATVCarrierInfo(
+            physical_channel='CATV_20',
+            carrier_type=CarrierType.TSMF,
+            transport_streams=[
+                CATVTransportStreamInfo(
+                    physical_channel='CATV_20',
+                    tsmf_relative_ts_number=1,
+                    transport_stream_id=16400,
+                    network_id=4,
+                    network_name='ＢＳデジタル',
+                    retransmission_source='BS',
+                    cas=CASInfo(required_card='B-CAS'),
+                    services=[
+                        CATVServiceInfo(service_id=700, service_type=0xC0, service_name='ＢＳ朝日データ', is_free=True),
+                        CATVServiceInfo(service_id=151, service_type=0x01, service_name='ＢＳ朝日', is_free=True),
+                    ],
+                ),
+                CATVTransportStreamInfo(
+                    physical_channel='CATV_20',
+                    tsmf_relative_ts_number=2,
+                    transport_stream_id=16626,
+                    network_id=4,
+                    network_name='ＢＳデジタル',
+                    retransmission_source='BS',
+                    cas=CASInfo(required_card='B-CAS'),
+                    services=[
+                        CATVServiceInfo(service_id=191, service_type=0x01, service_name='ＷＯＷＯＷプライム', is_free=False),
+                        CATVServiceInfo(service_id=192, service_type=0xC0, service_name='ＷＯＷＯＷデータ', is_free=True),
+                    ],
+                ),
+                CATVTransportStreamInfo(
+                    physical_channel='CATV_20',
+                    tsmf_relative_ts_number=3,
+                    transport_stream_id=24608,
+                    network_id=6,
+                    network_name='スカパー！',
+                    retransmission_source='CS',
+                    cas=CASInfo(required_card='B-CAS'),
+                    services=[
+                        CATVServiceInfo(service_id=237, service_type=0x01, service_name='スターチャンネル', is_free=False),
+                    ],
+                ),
+            ],
+        ),
+        CATVCarrierInfo(
+            physical_channel='CATV_30',
+            carrier_type=CarrierType.SingleTS,
+            transport_streams=[
+                CATVTransportStreamInfo(
+                    physical_channel='CATV_30',
+                    tsmf_relative_ts_number=None,
+                    transport_stream_id=0x3000,
+                    network_name='コミュニティ有料',
+                    retransmission_source='SelfBroadcast',
+                    cas=CASInfo(required_card='C-CAS'),
+                    services=[
+                        CATVServiceInfo(service_id=1, service_type=0x01, service_name='コミュニティ有料ch', is_free=False),
+                    ],
+                ),
+            ],
+        ),
+    ]
+
+
+class TestCATVChannelTypeAndNaming:
+    """BS/CS 再送信の type マッピングとサービス名ベースのチャンネル名のテスト (CI でも実行可能)"""
+
+    def test_retransmission_source_maps_to_bs_cs_type(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(Path('unused.yml'), BuildSyntheticRetransmissionCarriers()).format()
+        channels = LoadYaml(formatted_str)
+
+        rel1 = next(channel for channel in channels if channel.get('tsmfRelTs') == 1)
+        rel3 = next(channel for channel in channels if channel.get('tsmfRelTs') == 3)
+        self_broadcast = next(channel for channel in channels if channel['channel'] == 'CATV_30')
+        assert rel1['type'] == 'BS'  # BS 再送信
+        assert rel3['type'] == 'CS'  # CS 再送信
+        assert self_broadcast['type'] == 'GR'  # 自主放送は GR のまま
+
+    def test_bs_cs_channel_name_uses_video_service_name(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(Path('unused.yml'), BuildSyntheticRetransmissionCarriers()).format()
+        channels = LoadYaml(formatted_str)
+
+        rel1 = next(channel for channel in channels if channel.get('tsmfRelTs') == 1)
+        # network_name (ＢＳデジタル: BS 全 TS で共通) ではなく、映像サービス (0x01) のサービス名が使われること
+        # (サービス一覧の先頭がデータ放送 (0xC0) でも、映像サービスを優先すること)
+        assert rel1['name'] == 'ＢＳ朝日'
+        rel3 = next(channel for channel in channels if channel.get('tsmfRelTs') == 3)
+        assert rel3['name'] == 'スターチャンネル'
+        # 地上波再送信・自主放送は従来どおり network_name を使うこと
+        self_broadcast = next(channel for channel in channels if channel['channel'] == 'CATV_30')
+        assert self_broadcast['name'] == 'コミュニティ有料'
+
+    def test_mirakc_uses_same_type_mapping(self):
+        formatted_str = CATVMirakcConfigYmlFormatter(Path('unused.yml'), BuildSyntheticRetransmissionCarriers()).format()
+        channels = LoadYaml(formatted_str)
+
+        assert [channel['type'] for channel in channels] == ['BS', 'BS', 'CS', 'GR']
+        rel1 = next(channel for channel in channels if channel['name'] == 'ＢＳ朝日')
+        assert rel1['extra-args'] == '1'  # extra-args は従来どおり TSMF 相対 TS 番号のまま
+
+
+class TestCATVPayTvAndCASFiltering:
+    """--exclude-pay-tv / --bcas-only / --cas-as-sky に対応するフォーマッター動作のテスト (CI でも実行可能)"""
+
+    def test_exclude_pay_tv_filters_catv_entries(self):
+        carriers = BuildSyntheticRetransmissionCarriers()
+        formatted_str = CATVMirakurunChannelsYmlFormatter(Path('unused.yml'), carriers, exclude_pay_tv=True).format()
+        channels = LoadYaml(formatted_str)
+
+        # 無料 BS 再送信 (相対TS1) は残る
+        assert any(channel['name'] == 'ＢＳ朝日' for channel in channels)
+        # 有料映像 + 無料独立データ放送のみの BS 再送信 (WOWOW 型・相対TS2) は丸ごと除外される
+        assert all(channel.get('tsmfRelTs') != 2 for channel in channels)
+        # CS 再送信は全サービス除外扱いでエントリ自体が出力されない
+        assert all(channel['type'] != 'CS' for channel in channels)
+        # 有料自主放送 (is_free=False のみ) も除外される
+        assert all(channel['channel'] != 'CATV_30' for channel in channels)
+
+    def test_exclude_pay_tv_does_not_mutate_carriers(self):
+        carriers = BuildSyntheticRetransmissionCarriers()
+        CATVMirakurunChannelsYmlFormatter(Path('unused.yml'), carriers, exclude_pay_tv=True).format()
+
+        # フィルタリングで元の carriers の services が破壊されないこと
+        assert len(carriers[0].transport_streams[1].services) == 2
+        assert len(carriers[0].transport_streams[2].services) == 1
+
+    def test_bcas_only_excludes_non_bcas_channels(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'), BuildSyntheticRetransmissionCarriers(), bcas_only=True
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        # C-CAS が必要な自主放送は除外され、B-CAS で受信可能なチャンネルのみが残る
+        assert all(channel['channel'] != 'CATV_30' for channel in channels)
+        assert len(channels) == 3
+
+    def test_bcas_only_excludes_unknown_cas(self):
+        # required_card が 'unknown' (スクランブルされているが CAS 種別を特定できない) の TS も除外される
+        carriers = BuildSyntheticRetransmissionCarriers()
+        carriers[1].transport_streams[0].cas = CASInfo(required_card='unknown')
+        formatted_str = CATVMirakurunChannelsYmlFormatter(Path('unused.yml'), carriers, bcas_only=True).format()
+        channels = LoadYaml(formatted_str)
+        assert all(channel['channel'] != 'CATV_30' for channel in channels)
+
+    def test_cas_as_sky_outputs_sky_type(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'), BuildSyntheticRetransmissionCarriers(), cas_as_sky=True
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        # C-CAS が必要な自主放送は type: SKY になる
+        self_broadcast = next(channel for channel in channels if channel['channel'] == 'CATV_30')
+        assert self_broadcast['type'] == 'SKY'
+        # B-CAS で受信可能なチャンネルの type は変わらない
+        rel1 = next(channel for channel in channels if channel.get('tsmfRelTs') == 1)
+        assert rel1['type'] == 'BS'
+
+    def test_cas_as_sky_in_mirakc(self):
+        formatted_str = CATVMirakcConfigYmlFormatter(
+            Path('unused.yml'), BuildSyntheticRetransmissionCarriers(), cas_as_sky=True
+        ).format()
+        channels = LoadYaml(formatted_str)
+        self_broadcast = next(channel for channel in channels if channel['channel'] == 'CATV_30')
+        assert self_broadcast['type'] == 'SKY'
+
+
+def BuildSyntheticBSTsInfos() -> list[TransportStreamInfo]:
+    """
+    ネイティブ BS/CS 統合出力のテスト用に、合成の BS の TransportStreamInfo 一覧を組み立てる
+    - BS01/TS0: 無料放送のみの TS
+    - BS03/TS1: 有料放送 + 無料独立データ放送 (0xC0) のみの TS (WOWOW 型。--exclude-pay-tv で丸ごと除外される)
+    """
+
+    return [
+        TransportStreamInfo(
+            physical_channel='BS01/TS0',
+            transport_stream_id=16400,
+            network_id=4,
+            network_name='BS朝日',
+            satellite_frequency=11.72748,
+            satellite_transponder=1,
+            satellite_slot_number=0,
+            services=[
+                ServiceInfo(channel_number='151', service_id=151, service_type=0x01, service_name='BS朝日', is_free=True),
+            ],
+        ),
+        TransportStreamInfo(
+            physical_channel='BS03/TS1',
+            transport_stream_id=16626,
+            network_id=4,
+            network_name='WOWOW',
+            satellite_frequency=11.76597,
+            satellite_transponder=3,
+            satellite_slot_number=1,
+            services=[
+                ServiceInfo(channel_number='191', service_id=191, service_type=0x01, service_name='WOWOWプライム', is_free=False),
+                ServiceInfo(channel_number='192', service_id=192, service_type=0xC0, service_name='WOWOWデータ', is_free=True),
+            ],
+        ),
+    ]
+
+
+def BuildSyntheticCSTsInfos() -> list[TransportStreamInfo]:
+    """ネイティブ BS/CS 統合出力のテスト用に、合成の CS (CS1/CS2) の TransportStreamInfo 一覧を組み立てる"""
+
+    return [
+        TransportStreamInfo(
+            physical_channel='ND02',
+            transport_stream_id=24608,
+            network_id=6,
+            network_name='スカパー！',
+            satellite_frequency=12.291,
+            satellite_transponder=2,
+            services=[
+                ServiceInfo(channel_number='237', service_id=237, service_type=0x01, service_name='スターチャンネル', is_free=False),
+            ],
+        ),
+        TransportStreamInfo(
+            physical_channel='ND04',
+            transport_stream_id=28736,
+            network_id=7,
+            network_name='スカパー！',
+            satellite_frequency=12.331,
+            satellite_transponder=4,
+            services=[
+                ServiceInfo(channel_number='330', service_id=330, service_type=0x01, service_name='キッズステーション', is_free=False),
+            ],
+        ),
+    ]
+
+
+class TestSatelliteJSONFormatterSynthetic:
+    """合成データによる SatelliteJSONFormatter のテスト (CI でも実行可能)"""
+
+    def test_format_is_ts_info_array_with_computed_fields(self, tmp_path: Path):
+        result = json.loads(SatelliteJSONFormatter(tmp_path / 'BS.json', BuildSyntheticBSTsInfos()).format())
+
+        # ネイティブ isdb-scanner の Channels.json の "BS" キーの値と同じ、TS 情報の JSON 配列であること
+        assert isinstance(result, list)
+        assert [ts_info['physical_channel'] for ts_info in result] == ['BS01/TS0', 'BS03/TS1']
+        # computed_field (broadcast_type / physical_channel_recisdb) も含まれること
+        assert result[0]['broadcast_type'] == 'BS'
+        assert result[0]['physical_channel_recisdb'] == 'BS01_0'
+        # 有料放送のフィルタリングは行われない (JSON は常に全チャンネル出力)
+        assert result[1]['services'][0]['is_free'] is False
+
+    def test_save_writes_file(self, tmp_path: Path):
+        save_path = tmp_path / 'CS.json'
+        formatted_str = SatelliteJSONFormatter(save_path, BuildSyntheticCSTsInfos()).save()
+
+        assert save_path.is_file()
+        assert save_path.read_text(encoding='utf-8') == formatted_str
+        assert json.loads(formatted_str)[1]['physical_channel_recisdb'] == 'CS04'
+
+
+class TestCATVMirakurunChannelsYmlFormatterSatellite:
+    """ネイティブ BS/CS を統合した CATVMirakurunChannelsYmlFormatter のテスト (CI でも実行可能)"""
+
+    def test_satellite_entries_appended_after_catv_entries(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticCarriers(),
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        # CATV (GR) エントリの後に BS → CS の順で追記されること
+        assert [channel['type'] for channel in channels] == ['GR', 'GR', 'GR', 'BS', 'BS', 'CS', 'CS']
+
+        bs01 = next(channel for channel in channels if channel['name'] == 'BS01/TS0')
+        assert bs01['type'] == 'BS'
+        assert bs01['channel'] == 'BS01_0'  # recisdb 互換フォーマット
+        assert bs01['satellite'] == ' --tsid 16400 '  # 前後の半角スペースも保持されること
+        assert bs01['isDisabled'] is False
+        assert 'tsmfRelTs' not in bs01
+
+        nd04 = next(channel for channel in channels if channel['name'] == 'ND04')
+        assert nd04['type'] == 'CS'
+        assert nd04['channel'] == 'CS04'
+        assert nd04['satellite'] == ' --tsid 28736 '
+
+    def test_header_mentions_recisdb_tuner_example_only_with_satellite(self):
+        carriers = BuildSyntheticCarriers()
+
+        with_satellite = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'),
+            carriers,
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+        ).format()
+        assert 'recisdb' in with_satellite
+
+        # BS/CS なしの場合は従来と同一の出力 (ヘッダーにも recisdb 関連の記述が入らない) になること
+        without_satellite = CATVMirakurunChannelsYmlFormatter(Path('unused.yml'), carriers).format()
+        assert 'recisdb' not in without_satellite
+        assert without_satellite == CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'), carriers, tr_ts_infos=[], bs_ts_infos=[], cs_ts_infos=[], exclude_pay_tv=False
+        ).format()
+
+    def test_exclude_pay_tv_removes_pay_only_ts_and_cs(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticCarriers(),
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+            exclude_pay_tv=True,
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        # 無料放送を含む BS01/TS0 は残る
+        assert any(channel['name'] == 'BS01/TS0' for channel in channels)
+        # 有料放送 + 独立データ放送のみの BS03/TS1 (WOWOW 型) は丸ごと除外される
+        assert all(channel['name'] != 'BS03/TS1' for channel in channels)
+        # CS は全サービスが除外されるため、エントリ自体が出力されない
+        assert all(channel['type'] != 'CS' for channel in channels)
+        # CATV (GR) エントリのうち、無料サービスを含むものは残る
+        # (サービスが1つも解析できていない CATV_28 は、無料放送を確認できないため exclude_pay_tv では除外される)
+        assert len([channel for channel in channels if channel['type'] == 'GR']) == 2
+        assert all(channel['channel'] != 'CATV_28' for channel in channels)
+
+    def test_exclude_pay_tv_does_not_mutate_input(self):
+        bs_ts_infos = BuildSyntheticBSTsInfos()
+        cs_ts_infos = BuildSyntheticCSTsInfos()
+        CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticCarriers(),
+            bs_ts_infos=bs_ts_infos,
+            cs_ts_infos=cs_ts_infos,
+            exclude_pay_tv=True,
+        ).format()
+
+        # 既存 BaseFormatter と異なり、渡したリストの services が in-place で破壊されないこと
+        assert len(bs_ts_infos[1].services) == 2
+        assert len(cs_ts_infos[0].services) == 1
+
+
+class TestCATVMirakcConfigYmlFormatterSatellite:
+    """ネイティブ BS/CS を統合した CATVMirakcConfigYmlFormatter のテスト (CI でも実行可能)"""
+
+    def test_satellite_entries_use_tsid_extra_args(self):
+        formatted_str = CATVMirakcConfigYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticCarriers(),
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        assert [channel['type'] for channel in channels] == ['GR', 'GR', 'GR', 'BS', 'BS', 'CS', 'CS']
+
+        bs01 = next(channel for channel in channels if channel['name'] == 'BS01/TS0')
+        assert bs01['channel'] == 'BS01_0'
+        assert bs01['extra-args'] == '--tsid 16400'
+        assert bs01['disabled'] is False
+
+        nd02 = next(channel for channel in channels if channel['name'] == 'ND02')
+        assert nd02['type'] == 'CS'
+        assert nd02['channel'] == 'CS02'
+        assert nd02['extra-args'] == '--tsid 24608'
+
+        # CATV (GR) エントリの extra-args (TSMF 相対 TS 番号) はそのまま維持されること
+        catv_15_extra_args = {channel['extra-args'] for channel in channels if channel['channel'] == 'CATV_15'}
+        assert catv_15_extra_args == {'1', '2'}
+
+    def test_output_identical_to_previous_without_satellite(self):
+        carriers = BuildSyntheticCarriers()
+        without_satellite = CATVMirakcConfigYmlFormatter(Path('unused.yml'), carriers).format()
+        assert 'recisdb' not in without_satellite
+        assert without_satellite == CATVMirakcConfigYmlFormatter(
+            Path('unused.yml'), carriers, tr_ts_infos=[], bs_ts_infos=[], cs_ts_infos=[], exclude_pay_tv=False
+        ).format()
+
+    def test_exclude_pay_tv_removes_pay_only_ts_and_cs(self):
+        formatted_str = CATVMirakcConfigYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticCarriers(),
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+            exclude_pay_tv=True,
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        assert any(channel['name'] == 'BS01/TS0' for channel in channels)
+        assert all(channel['name'] != 'BS03/TS1' for channel in channels)
+        assert all(channel['type'] != 'CS' for channel in channels)
+
+
 class TestCATVMirakcConfigYmlFormatterSynthetic:
     """合成データによる CATVMirakcConfigYmlFormatter のテスト (CI でも実行可能)"""
 
@@ -254,6 +662,310 @@ class TestCATVMirakcConfigYmlFormatterSynthetic:
 
         formatted_str = CATVMirakcConfigYmlFormatter(save_path, carriers).save()
 
+        assert save_path.is_file()
+        assert save_path.read_text(encoding='utf-8') == formatted_str
+
+
+def BuildSyntheticTerrestrialTsInfos() -> list[TransportStreamInfo]:
+    """
+    ネイティブ地上波統合出力のテスト用に、合成の地上波の TransportStreamInfo 一覧を組み立てる
+    - T21/TSID 0x1000 (=4096): BuildSyntheticCarriers の CATV_15 相対TS1 (Terrestrial・同 TSID) と重複する地上波 TS
+    """
+
+    return [
+        TransportStreamInfo(
+            physical_channel='T21',
+            transport_stream_id=0x1000,
+            network_id=32752,
+            network_name='サンプル放送',
+            remote_control_key_id=5,
+            services=[
+                ServiceInfo(channel_number='051', service_id=1024, service_type=0x01, service_name='サンプルサービス1', is_free=True),
+            ],
+        ),
+    ]
+
+
+class TestNativeJSONFormatterAndAlias:
+    """NativeJSONFormatter (旧 SatelliteJSONFormatter) と後方互換エイリアスのテスト"""
+
+    def test_alias_points_to_native_formatter(self):
+        # 後方互換エイリアスが NativeJSONFormatter を指していること
+        assert SatelliteJSONFormatter is NativeJSONFormatter
+
+    def test_native_json_formatter_handles_terrestrial(self, tmp_path: Path):
+        result = json.loads(NativeJSONFormatter(tmp_path / 'Terrestrial.json', BuildSyntheticTerrestrialTsInfos()).format())
+
+        assert isinstance(result, list)
+        assert result[0]['physical_channel'] == 'T21'
+        assert result[0]['broadcast_type'] == 'Terrestrial'
+        assert result[0]['physical_channel_recisdb'] == 'T21'
+
+
+class TestCATVTerrestrialIntegration:
+    """ネイティブ地上波を統合した CATVMirakurunChannelsYmlFormatter / CATVMirakcConfigYmlFormatter のテスト"""
+
+    def test_terrestrial_appended_before_bs_cs(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticCarriers(),
+            tr_ts_infos=BuildSyntheticTerrestrialTsInfos(),
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        # CATV (GR) x3 の後に ネイティブ 地上波(GR) → BS → CS の順で追記されること
+        assert [channel['type'] for channel in channels] == ['GR', 'GR', 'GR', 'GR', 'BS', 'BS', 'CS', 'CS']
+
+        native_terrestrial = next(channel for channel in channels if channel['channel'] == 'T21')
+        assert native_terrestrial['type'] == 'GR'
+        assert native_terrestrial['name'] == 'サンプル放送'  # network_name (= TS 名 = 放送局名) が使われること
+        assert native_terrestrial['satellite'] == ' '  # 地上波は satellite が半角スペース1個
+        assert native_terrestrial['isDisabled'] is False
+
+    def test_terrestrial_in_mirakc_has_empty_extra_args(self):
+        formatted_str = CATVMirakcConfigYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticCarriers(),
+            tr_ts_infos=BuildSyntheticTerrestrialTsInfos(),
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        native_terrestrial = next(channel for channel in channels if channel['channel'] == 'T21')
+        assert native_terrestrial['type'] == 'GR'
+        assert native_terrestrial['name'] == 'サンプル放送'
+        assert native_terrestrial['extra-args'] == ''  # 地上波は extra-args が空文字列
+        assert native_terrestrial['disabled'] is False
+
+    def test_terrestrial_only_still_backward_compatible_default(self):
+        # tr/bs/cs すべて省略時は従来と完全に同一の出力になること (既定値互換)
+        carriers = BuildSyntheticCarriers()
+        default_output = CATVMirakurunChannelsYmlFormatter(Path('unused.yml'), carriers).format()
+        explicit_empty = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'), carriers, tr_ts_infos=[], bs_ts_infos=[], cs_ts_infos=[]
+        ).format()
+        assert default_output == explicit_empty
+
+
+class TestNormalizeChannelName:
+    """NormalizeChannelName ヘルパーと normalize_names パラメータのテスト"""
+
+    def test_fullwidth_alnum_and_symbols_converted(self):
+        assert NormalizeChannelName('ＢＳ朝日') == 'BS朝日'  # 全角ラテン英字 → 半角、漢字はそのまま
+        assert NormalizeChannelName('ＷＯＷＯＷプライム') == 'WOWOWプライム'
+        assert NormalizeChannelName('ＮＨＫ　ＢＳ１') == 'NHK BS1'  # 全角スペース (U+3000) → 半角スペース
+        assert NormalizeChannelName('！？＃＆') == '!?#&'  # 全角記号 → 半角記号
+
+    def test_hiragana_katakana_unchanged(self):
+        # ひらがな・カタカナ・記号以外の全角文字はそのまま維持する
+        assert NormalizeChannelName('スターチャンネル') == 'スターチャンネル'
+
+    def test_normalize_names_applies_to_name_field_mirakurun(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'), BuildSyntheticRetransmissionCarriers(), normalize_names=True
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        # ＢＳ朝日 → BS朝日 に正規化されること
+        assert any(channel['name'] == 'BS朝日' for channel in channels)
+        assert all(channel['name'] != 'ＢＳ朝日' for channel in channels)
+
+    def test_normalize_names_false_keeps_fullwidth(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'), BuildSyntheticRetransmissionCarriers()
+        ).format()
+        channels = LoadYaml(formatted_str)
+        assert any(channel['name'] == 'ＢＳ朝日' for channel in channels)
+
+    def test_normalize_names_applies_in_mirakc(self):
+        formatted_str = CATVMirakcConfigYmlFormatter(
+            Path('unused.yml'), BuildSyntheticRetransmissionCarriers(), normalize_names=True
+        ).format()
+        channels = LoadYaml(formatted_str)
+        assert any(channel['name'] == 'BS朝日' for channel in channels)
+
+
+class TestPreferDeduplication:
+    """--prefer による重複チャンネルの自動 disable のテスト"""
+
+    def test_prefer_none_all_enabled(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticRetransmissionCarriers(),
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+        ).format()
+        channels = LoadYaml(formatted_str)
+        assert all(channel['isDisabled'] is False for channel in channels)
+
+    def test_prefer_catv_disables_duplicated_native_entries(self):
+        formatted_str = CATVMirakurunChannelsYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticRetransmissionCarriers(),
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+            prefer=PreferredSource.CATV,
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        # CATV 再送信側 (channel が CATV_* のエントリ) はすべて有効のまま
+        assert all(channel['isDisabled'] is False for channel in channels if channel['channel'].startswith('CATV_'))
+        # ネイティブ BS/CS で CATV 再送信と TSID が重複するエントリは disable される
+        bs01 = next(channel for channel in channels if channel['name'] == 'BS01/TS0')  # BS TSID 16400 が重複
+        assert bs01['isDisabled'] is True
+        nd02 = next(channel for channel in channels if channel['name'] == 'ND02')  # CS TSID 24608 が重複
+        assert nd02['isDisabled'] is True
+        # 重複しないネイティブ CS (ND04 TSID 28736) は有効のまま
+        nd04 = next(channel for channel in channels if channel['name'] == 'ND04')
+        assert nd04['isDisabled'] is False
+        # ヘッダーに disable した旨のコメントが追記されること
+        assert 'catv' in formatted_str and 'isDisabled: true' in formatted_str
+
+    def test_prefer_native_disables_duplicated_catv_entries(self):
+        formatted_str = CATVMirakcConfigYmlFormatter(
+            Path('unused.yml'),
+            BuildSyntheticRetransmissionCarriers(),
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+            prefer=PreferredSource.NATIVE,
+        ).format()
+        channels = LoadYaml(formatted_str)
+
+        # ネイティブ側 (channel が T**/BS**_*/CS** のエントリ) はすべて有効のまま
+        assert all(
+            channel['disabled'] is False for channel in channels if not channel['channel'].startswith('CATV_')
+        )
+        # CATV 再送信 BS (TSID 16400) は重複するため disable される
+        catv_bs = next(
+            channel for channel in channels if channel['channel'] == 'CATV_20' and channel['extra-args'] == '1'
+        )
+        assert catv_bs['disabled'] is True
+        # CATV 再送信 CS (TSID 24608) も重複するため disable される
+        catv_cs = next(
+            channel for channel in channels if channel['channel'] == 'CATV_20' and channel['extra-args'] == '3'
+        )
+        assert catv_cs['disabled'] is True
+        # 自主放送 (CATV_30・ネイティブに対応なし) は有効のまま
+        self_broadcast = next(channel for channel in channels if channel['channel'] == 'CATV_30')
+        assert self_broadcast['disabled'] is False
+
+
+class TestGetEmittedCATVChannelTypes:
+    """GetEmittedCATVChannelTypes ヘルパーのテスト"""
+
+    def test_returns_types_in_fixed_order(self):
+        types = GetEmittedCATVChannelTypes(BuildSyntheticRetransmissionCarriers())
+        # CATV_20 (BS/BS/CS) + CATV_30 (GR) → GR → BS → CS の順
+        assert types == ['GR', 'BS', 'CS']
+
+    def test_cas_as_sky_adds_sky_type(self):
+        types = GetEmittedCATVChannelTypes(BuildSyntheticRetransmissionCarriers(), cas_as_sky=True)
+        # C-CAS が必要な CATV_30 (自主放送) が SKY になる
+        assert types == ['BS', 'CS', 'SKY']
+
+    def test_only_gr_for_terrestrial_only_carriers(self):
+        assert GetEmittedCATVChannelTypes(BuildSyntheticCarriers()) == ['GR']
+
+    def test_prefer_does_not_change_result(self):
+        # prefer や tr/bs/cs 引数を渡しても CATV エントリの type 集合は変わらない
+        base = GetEmittedCATVChannelTypes(BuildSyntheticRetransmissionCarriers())
+        with_prefer = GetEmittedCATVChannelTypes(
+            BuildSyntheticRetransmissionCarriers(),
+            prefer=PreferredSource.NATIVE,
+            bs_ts_infos=BuildSyntheticBSTsInfos(),
+            cs_ts_infos=BuildSyntheticCSTsInfos(),
+        )
+        assert base == with_prefer
+
+
+class _FakeCATVTuner:
+    """CATVMirakurunTunersYmlFormatter / CATVMirakcTunersYmlFormatter が参照する属性のみを持つ CATVTuner の代替"""
+
+    def __init__(self, name: str, adapter_number: int) -> None:
+        self.name = name
+        self.adapter_number = adapter_number
+
+
+class _FakeISDBTuner:
+    """tuners フォーマッターが参照する属性のみを持つ ISDBTuner の代替"""
+
+    def __init__(self, name: str, device_path: str, tuner_type: str, tsid_supported: bool) -> None:
+        self.name = name
+        self.device_path = device_path
+        self.type = tuner_type
+        self._tsid_supported = tsid_supported
+
+    def isTSIDSelectionSupported(self) -> bool:
+        return self._tsid_supported
+
+
+class TestCATVTunersYmlFormatter:
+    """tuners 設定自動生成 (CATVMirakurunTunersYmlFormatter / CATVMirakcTunersYmlFormatter) のテスト"""
+
+    def test_mirakurun_catv_and_isdb_tuner_entries(self):
+        catv_tuners = [_FakeCATVTuner('DVB-C Tuner', 0)]
+        isdbt_tuners = [_FakeISDBTuner('ISDB-T Tuner', '/dev/pt3video0', 'ISDB-T', False)]
+        isdbs_tuners = [_FakeISDBTuner('ISDB-S Tuner', '/dev/px4video0', 'ISDB-S', True)]
+        formatted_str = CATVMirakurunTunersYmlFormatter(
+            Path('unused.yml'), catv_tuners, isdbt_tuners, isdbs_tuners, Path('/tmp/dvbv5.conf'), ['GR', 'BS', 'CS']
+        ).format()
+        tuners = LoadYaml(formatted_str)
+
+        catv = next(tuner for tuner in tuners if 'adapter0' in tuner['name'])
+        assert catv['name'] == 'DVB-C Tuner (adapter0)'
+        assert catv['types'] == ['GR', 'BS', 'CS']
+        assert catv['command'] == 'dvbv5-zap -c /tmp/dvbv5.conf -a 0 -P -t 0 -o - <channel>'
+        assert catv['isDisabled'] is False
+
+        isdbt = next(tuner for tuner in tuners if tuner['name'] == 'ISDB-T Tuner')
+        assert isdbt['types'] == ['GR']
+        assert isdbt['command'] == 'recisdb tune --device /dev/pt3video0 --channel <channel> -'
+
+        isdbs = next(tuner for tuner in tuners if tuner['name'] == 'ISDB-S Tuner')
+        assert isdbs['types'] == ['BS', 'CS']
+        # TSID 選局対応の ISDB-S では <satellite> が連続スペースを避ける形で埋め込まれる
+        assert isdbs['command'] == 'recisdb tune --device /dev/px4video0 --channel <channel><satellite>-'
+
+    def test_mirakc_catv_and_isdb_tuner_entries(self):
+        catv_tuners = [_FakeCATVTuner('DVB-C Tuner', 1)]
+        isdbs_tuners = [_FakeISDBTuner('ISDB-S Tuner', '/dev/px4video0', 'ISDB-S', True)]
+        formatted_str = CATVMirakcTunersYmlFormatter(
+            Path('unused.yml'), catv_tuners, [], isdbs_tuners, Path('/tmp/dvbv5.conf'), ['GR', 'BS', 'CS']
+        ).format()
+        tuners = LoadYaml(formatted_str)
+
+        catv = next(tuner for tuner in tuners if 'adapter1' in tuner['name'])
+        assert catv['command'] == 'dvbv5-zap -c /tmp/dvbv5.conf -a 1 -P -t 0 -o - {{{channel}}}'
+        assert catv['disabled'] is False
+
+        isdbs = next(tuner for tuner in tuners if tuner['name'] == 'ISDB-S Tuner')
+        assert isdbs['command'] == 'recisdb tune --device /dev/px4video0 --channel {{{channel}}} {{{extra_args}}} -'
+        # isdb-tsmf-split のパイプが必要な旨がヘッダーコメントに含まれること
+        assert 'isdb-tsmf-split' in formatted_str
+
+    def test_empty_section_omitted(self):
+        # ISDB-T チューナーが空ならそのセクションは出力されない (CATV/ISDB-S のみ)
+        formatted_str = CATVMirakurunTunersYmlFormatter(
+            Path('unused.yml'), [_FakeCATVTuner('DVB-C Tuner', 0)], [], [], Path('/tmp/dvbv5.conf'), ['GR']
+        ).format()
+        tuners = LoadYaml(formatted_str)
+        assert len(tuners) == 1
+        assert tuners[0]['name'] == 'DVB-C Tuner (adapter0)'
+
+    def test_all_empty_returns_comment_only(self):
+        # 全チューナーが空なら説明コメントのみ (YAML 本体なし) を返す
+        formatted_str = CATVMirakurunTunersYmlFormatter(
+            Path('unused.yml'), [], [], [], Path('/tmp/dvbv5.conf'), []
+        ).format()
+        assert LoadYaml(formatted_str) is None
+        assert formatted_str.lstrip().startswith('#')
+
+    def test_save_writes_file(self, tmp_path: Path):
+        save_path = tmp_path / 'tuners.yml'
+        formatted_str = CATVMirakcTunersYmlFormatter(
+            save_path, [_FakeCATVTuner('DVB-C Tuner', 0)], [], [], Path('/tmp/dvbv5.conf'), ['GR']
+        ).save()
         assert save_path.is_file()
         assert save_path.read_text(encoding='utf-8') == formatted_str
 
