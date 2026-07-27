@@ -290,6 +290,8 @@ def PatchSatelliteScan(monkeypatch: pytest.MonkeyPatch, isdbs_tuners: list[FakeI
     """ISDBTuner.getAvailableISDBSTuners() と衛星スキャン用の TransportStreamAnalyzer を合成実装に差し替える"""
 
     monkeypatch.setattr(ISDBTuner, 'getAvailableISDBSTuners', lambda **kwargs: isdbs_tuners)
+    # 偽チューナーは実デバイスを持たないため、RobustISDBTuner への変換 (実デバイス検証を伴う) は素通しにする
+    monkeypatch.setattr('isdb_scanner.catv.scan.AsRobustISDBTuners', lambda tuners: tuners)
     monkeypatch.setattr('isdb_scanner.catv.satellite.TransportStreamAnalyzer', _FakeTransportStreamAnalyzer)
 
 
@@ -455,6 +457,8 @@ def PatchTerrestrialScan(monkeypatch: pytest.MonkeyPatch, isdbt_tuners: list[Fak
     """ISDBTuner.getAvailableISDBTTuners() と地上波スキャン用の TransportStreamAnalyzer を合成実装に差し替える"""
 
     monkeypatch.setattr(ISDBTuner, 'getAvailableISDBTTuners', lambda **kwargs: isdbt_tuners)
+    # 偽チューナーは実デバイスを持たないため、RobustISDBTuner への変換 (実デバイス検証を伴う) は素通しにする
+    monkeypatch.setattr('isdb_scanner.catv.scan.AsRobustISDBTuners', lambda tuners: tuners)
     monkeypatch.setattr('isdb_scanner.catv.terrestrial.TransportStreamAnalyzer', _FakeTerrestrialTransportStreamAnalyzer)
 
 

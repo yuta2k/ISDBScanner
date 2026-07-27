@@ -44,6 +44,7 @@ from isdb_scanner.catv.formatter import (
     NativeJSONFormatter,
 )
 from isdb_scanner.catv.native_diff import BuildNativeScanDiffReport
+from isdb_scanner.catv.native_tuner import AsRobustISDBTuners
 from isdb_scanner.catv.satellite import ScanSatelliteChannels
 from isdb_scanner.catv.terrestrial import ScanTerrestrialChannels
 from isdb_scanner.catv.tuner import CATVTuner
@@ -588,7 +589,10 @@ def main(
             print('[yellow]recisdb not found. Skipping native BS/CS (satellite) scan.[/yellow]')
             satellite = False
         else:
-            satellite_tuners = ISDBTuner.getAvailableISDBSTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
+            # ハング対策付きの RobustISDBTuner に変換してから使う (V4L-DVB でのストリーム停止によるハングを防ぐ)
+            satellite_tuners = AsRobustISDBTuners(
+                ISDBTuner.getAvailableISDBSTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
+            )
             if len(satellite_tuners) == 0:
                 print('[yellow]No ISDB-S tuner found. Skipping native BS/CS (satellite) scan.[/yellow]')
                 satellite = False
@@ -601,7 +605,10 @@ def main(
             print('[yellow]recisdb not found. Skipping native terrestrial (ISDB-T) scan.[/yellow]')
             terrestrial = False
         else:
-            terrestrial_tuners = ISDBTuner.getAvailableISDBTTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
+            # ハング対策付きの RobustISDBTuner に変換してから使う (V4L-DVB でのストリーム停止によるハングを防ぐ)
+            terrestrial_tuners = AsRobustISDBTuners(
+                ISDBTuner.getAvailableISDBTTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
+            )
             if len(terrestrial_tuners) == 0:
                 print('[yellow]No ISDB-T tuner found. Skipping native terrestrial (ISDB-T) scan.[/yellow]')
                 terrestrial = False
