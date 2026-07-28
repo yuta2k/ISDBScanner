@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from isdb_scanner.catv.cards import CardType, DetectedCard
-from isdb_scanner.catv.constants import CarrierType, CATVCarrierInfo, RequiredCASCard
+from isdb_scanner.catv.constants import BuildMirakcTSMFChannelName, CarrierType, CATVCarrierInfo, RequiredCASCard
 
 
 # CATV トラモジでは、地デジ/BS/CS の再送信チャンネルは元の B-CAS スクランブルのまま流れてくる一方、
@@ -120,17 +120,29 @@ def GetReaderNameForRequiredCard(required_card: RequiredCASCard, detected_cards:
     return None
 
 
-def CollectCCASPhysicalChannels(carriers: list[CATVCarrierInfo]) -> list[str]:
+def CollectCCASMirakcChannelNames(carriers: list[CATVCarrierInfo]) -> list[str]:
     """
-    スキャン結果から、C-CAS カードが必要な TS が多重されている物理チャンネル名の一覧を返す (重複なし・昇順)
-    ここで返る物理チャンネル名は Mirakurun/mirakc の channels 設定に出力される `channel` の値そのもので、
-    mirakc の decode-filter に渡される Mustache 変数 {{{channel}}} と一致する
+    スキャン結果から、C-CAS カードが必要な TS に対応する mirakc の channel 名の一覧を返す (重複なし・昇順)
+
+    ここで返る文字列は mirakc の channels 設定 (CATVMirakcConfigYmlFormatter の出力) に現れる `channel` の値
+    そのもので、decode-filter に渡される Mustache 変数 {{{channel}}} と一致する:
+    - TSMF キャリア: 相対 TS ごとにユニーク化された名前 (ex: "CATV_20#3")。C-CAS が必要な相対 TS の分だけを返すため、
+      同一キャリアに B-CAS 再送信と C-CAS 自主放送が混在していても、B-CAS 側の相対 TS には C-CAS リーダーを使わない
+    - SingleTS キャリア: 物理チャンネル名そのまま (ex: "CATV_21")
+    - TLV (4K/8K MMT) キャリア: transport_streams が空のため自然に対象外
+      (TS ベースの mirakc では扱えず channels にも出力されないため、decode-filter の分岐にも現れない)
     """
 
-    physical_channels = {
-        carrier.physical_channel for carrier in carriers for ts_info in carrier.transport_streams if ts_info.cas.required_card == 'C-CAS'
-    }
-    return sorted(physical_channels)
+    channel_names: set[str] = set()
+    for carrier in carriers:
+        for ts_info in carrier.transport_streams:
+            if ts_info.cas.required_card != 'C-CAS':
+                continue
+            if ts_info.tsmf_relative_ts_number is not None:
+                channel_names.add(BuildMirakcTSMFChannelName(carrier.physical_channel, ts_info.tsmf_relative_ts_number))
+            else:
+                channel_names.add(carrier.physical_channel)
+    return sorted(channel_names)
 
 
 def FormatDetectedCardsSummary(detected_cards: list[DetectedCard] | None, detection_error: str | None) -> str | None:
@@ -395,14 +407,15 @@ def BuildMirakurunDecoderScript(card_label: str, reader_name: str) -> str:
     return '\n'.join(lines) + '\n'
 
 
-def BuildMirakcDecodeFilterScript(bcas_reader_name: str, ccas_reader_name: str, ccas_physical_channels: list[str]) -> str:
+def BuildMirakcDecodeFilterScript(bcas_reader_name: str, ccas_reader_name: str, ccas_channel_names: list[str]) -> str:
     """
     mirakc の filters.decode-filter.command に指定する decode-filter スクリプトの中身を組み立てる
 
     Args:
         bcas_reader_name (str): B-CAS カードが挿さっているカードリーダーの名前
         ccas_reader_name (str): C-CAS カードが挿さっているカードリーダーの名前
-        ccas_physical_channels (list[str]): C-CAS カードが必要な物理チャンネル名の一覧 (channels 設定の `channel` の値)
+        ccas_channel_names (list[str]): C-CAS カードが必要な mirakc の channel 名の一覧
+            (TSMF は相対 TS 単位のユニーク名 (ex: "CATV_20#3")、SingleTS は物理チャンネル名)
 
     Returns:
         str: シェルスクリプトの中身 (末尾に改行を1つ含む)
@@ -429,13 +442,17 @@ def BuildMirakcDecodeFilterScript(bcas_reader_name: str, ccas_reader_name: str, 
         f"#       command: /path/to/{MIRAKC_DECODE_FILTER_SCRIPT_NAME} '{{{{{{channel_name}}}}}}' '{{{{{{channel_type}}}}}}' '{{{{{{channel}}}}}}'",
         '#',
         '# 分岐は --cas-as-sky (C-CAS が必要なチャンネルを type: SKY として出力するオプション) の指定有無に',
-        '# 依存しないよう、channel_type ではなく「C-CAS が必要な物理チャンネル名の明示リスト」で行う。',
-        '# 下記のリストは、スキャン結果のうち required_card == "C-CAS" の TS が多重されていた物理チャンネル。',
+        '# 依存しないよう、channel_type ではなく「C-CAS が必要な channel 名の明示リスト」で行う。',
+        '# 下記のリストは、スキャン結果のうち required_card == "C-CAS" だった TS に対応する channel 名。',
         '#',
-        '# ※ mirakc は type と channel が同じ channels エントリをマージしてしまうため、TSMF 多重チャンネルは',
-        '#   相対 TS ごとに channel をユニークな名前 (例: CATV_15#1) へ書き換えて使う必要がある',
-        '#   (channels_catv.yml のヘッダーコメント参照)。書き換えた場合は、下記 case のパターンも',
-        '#   その名前に合わせて追記すること (このスクリプトには $3 = channel の値がそのまま渡るため)。',
+        '# ※ mirakc は type と channel が同じ channels エントリをマージしてしまうため、TSMF 多重チャンネルの',
+        '#   channel は channels_catv.yml 側で相対 TS ごとにユニークな名前 (例: CATV_15#1) として出力される',
+        '#   (channels_catv.yml のヘッダーコメント参照)。下記 case のパターンもその channel 名に自動で',
+        '#   揃えて生成しているため、手作業での追記は不要 (このスクリプトには $3 = channel の値がそのまま渡る)。',
+        '# ※ このため分岐は物理チャンネル (キャリア) 単位ではなく TS 単位の粒度になっている。同一の TSMF キャリアに',
+        '#   B-CAS の再送信 TS と C-CAS の自主放送 TS が混在していても、C-CAS が必要な相対 TS のみ C-CAS リーダーを',
+        '#   使い、それ以外の相対 TS は既定 (*) 側の B-CAS リーダーで復号される。',
+        '#   SingleTS のチャンネルは分離が不要なため、従来どおり物理チャンネル名がそのままパターンになる。',
         '#',
     ]
     lines.extend(RECISDB_DECODE_ARGUMENT_REFERENCE_LINES)
@@ -445,7 +462,8 @@ def BuildMirakcDecodeFilterScript(bcas_reader_name: str, ccas_reader_name: str, 
             f'# B-CAS 用リーダー: {bcas_reader_name}',
             f'# C-CAS 用リーダー: {ccas_reader_name}',
             '',
-            '# 位置引数: $1 = channel_name / $2 = channel_type / $3 = channel (物理チャンネル名)',
+            '# 位置引数: $1 = channel_name / $2 = channel_type / $3 = channel',
+            '# $3 には TSMF なら CATV_15#1 形式のユニークな channel 名、SingleTS なら物理チャンネル名がそのまま渡る',
             '# 分岐に使うのは $3 のみだが、独自にカスタマイズしやすいよう channel_name / channel_type も受け取っている',
             'CHANNEL_NAME="$1"',
             'CHANNEL_TYPE="$2"',
@@ -454,10 +472,11 @@ def BuildMirakcDecodeFilterScript(bcas_reader_name: str, ccas_reader_name: str, 
         ]
     )
 
-    if len(ccas_physical_channels) > 0:
+    if len(ccas_channel_names) > 0:
         lines.append('case "$CHANNEL" in')
-        # 物理チャンネル名はグロブとして解釈されないよう shlex.quote() を通す (英数字と _ のみの場合はそのまま)
-        pattern = '|'.join(shlex.quote(physical_channel) for physical_channel in ccas_physical_channels)
+        # channel 名はグロブとして解釈されないよう shlex.quote() を通す (英数字と _ のみの場合はそのまま)
+        # TSMF のユニーク名に含まれる `#` は shlex.quote() でシングルクォートされるため、case のパターンとしても安全
+        pattern = '|'.join(shlex.quote(channel_name) for channel_name in ccas_channel_names)
         lines.extend(
             [
                 f'    {pattern})',
@@ -523,7 +542,7 @@ def WriteDecoderScripts(
         ),
         _WriteScript(
             output_dir / 'mirakc' / MIRAKC_DECODE_FILTER_SCRIPT_NAME,
-            BuildMirakcDecodeFilterScript(bcas_reader_name, ccas_reader_name, CollectCCASPhysicalChannels(carriers)),
+            BuildMirakcDecodeFilterScript(bcas_reader_name, ccas_reader_name, CollectCCASMirakcChannelNames(carriers)),
         ),
     ]
 

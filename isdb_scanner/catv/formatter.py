@@ -19,6 +19,7 @@ from isdb_scanner.catv.cards import CardType, DetectedCard
 from isdb_scanner.catv.constants import (
     CATV_FREQUENCY_TABLE,
     BuildDvbv5ConfEntryLines,
+    BuildMirakcTSMFChannelName,
     CarrierType,
     CATVCarrierInfo,
     CATVTransportStreamInfo,
@@ -628,9 +629,11 @@ class CATVMirakcConfigYmlFormatter(CATVBaseFormatter):
     ただし mirakc の tuners[].command はシェルを介さず exec されるため (mirakc-core/src/command_util.rs の
     CommandBuilder::new() が shell_words::split() で単語分割し Command::new(prog).args(args) を実行する)、
     command に `|` をそのまま書いてもパイプにはならない。パイプを張るには command 全体を `sh -c '...'` の
-    1 引数にまとめる必要があり、さらに mirakc は type と channel が同じ channels エントリをマージするため
-    (mirakc-core/src/config.rs の ChannelConfig::normalize())、相対 TS ごとに channel をユニークな名前に
-    書き換えて使う必要がある。これらの検証結果と具体的な組み込み方はヘッダーコメントに書き出す
+    1 引数にまとめる必要がある。さらに mirakc は type と channel が同じ channels エントリをマージするため
+    (mirakc-core/src/config.rs の ChannelConfig::normalize())、TSMF エントリの channel には物理チャンネル名では
+    なく BuildMirakcTSMFChannelName() が組み立てる相対 TS ごとにユニークな名前 (ex: "CATV_15#1") を出力する
+    (SingleTS のエントリは分離が不要なため従来どおり物理チャンネル名のまま)。これらの検証結果と具体的な組み込み方は
+    ヘッダーコメントに書き出す
 
     完全な mirakc の config.yml 全体ではなく、channels 部分の断片 + 運用方法の説明コメントのみを出力する
     (tuners 側の具体的な command テンプレートは環境 (アダプタ数・isdb-tsmf-split の組み込み方) によって変わるため、
@@ -703,15 +706,21 @@ class CATVMirakcConfigYmlFormatter(CATVBaseFormatter):
             '# 通す必要がある。以下の channels 断片では、TSMF の各エントリの extra-args に相対 TS 番号 (1-15) を',
             '# 出力している。組み込み方は mirakc 本体のソースを確認した上で、以下の 1) 2) の手順に整理している。',
             '#',
-            '# 1) 相対 TS ごとに channel をユニークな名前に書き換える',
+            '# 1) 相対 TS ごとにユニークな channel 名 (<物理チャンネル名>#<相対TS番号>) を自動出力している',
             '#    mirakc は type と channel が同じ channels エントリを 1 つにマージし、extra-args が食い違っていても',
             '#    警告を出すだけで先勝ちになる (mirakc-core/src/config.rs の ChannelConfig::normalize() と',
             '#    impl PartialEq for ChannelConfig)。mirakc-core/src/tuner.rs の TunerSession::is_reuseable() も',
-            '#    channel_type と channel だけでチューナーセッションの再利用を判定する。このため下記の TSMF エントリ',
-            '#    (channel が同じで extra-args だけが異なる) をそのまま config.yml に貼ると、1 本の相対 TS しか',
-            '#    使えない。channel を CATV_15#1 / CATV_15#2 のように相対 TS ごとにユニークな名前へ書き換えること',
+            '#    channel_type と channel だけでチューナーセッションの再利用を判定する。このため TSMF エントリの',
+            '#    channel を物理チャンネル名のままにすると (channel が同じで extra-args だけが異なる状態になり)、',
+            '#    1 本の相対 TS しか使えなくなる。そこで本ファイルでは TSMF の各エントリの channel を',
+            '#    CATV_15#1 / CATV_15#2 のように相対 TS ごとにユニークな名前として出力しているため、',
+            '#    そのまま config.yml に貼るだけでよく、手で書き換える必要はない',
             '#    (下記 command 例の ${1%%#*} が `#` 以降を落として dvbv5-zap に渡すため、dvbv5 conf 側は変更不要)。',
-            '#    decode-filter.sh を併用する場合は、スクリプト内の case のパターンも書き換えた channel 名に合わせること。',
+            '#    SingleTS のエントリは TSMF 分離が不要なため、従来どおり物理チャンネル名のまま出力している。',
+            '#    decode-filter.sh を併用する場合も、スクリプト内の case のパターンはここに出力される channel 名に',
+            '#    自動で揃えて生成されるため、手作業での追記は不要。',
+            '#    ※ channel ベースの mirakc Web API (/api/channels/<type>/<channel>/...) を叩く場合は、',
+            '#      URL 中の `#` を %23 にエスケープすること (エスケープしないとフラグメント扱いになる)。',
             '#',
             '# 2) tuners[].command は `sh -c` にまとめてシェル側でパイプを張る',
             '#    mirakc はレンダリング結果をシェルに渡さず、shell_words で単語分割してそのまま exec する',
@@ -787,12 +796,20 @@ class CATVMirakcConfigYmlFormatter(CATVBaseFormatter):
         channels: list[CATVMirakcChannel] = []
         for carrier, ts_info in catv_pairs:
             extra_args = str(ts_info.tsmf_relative_ts_number) if ts_info.tsmf_relative_ts_number is not None else ''
+            # mirakc は type と channel が同じエントリを 1 つにマージしてしまうため (ChannelConfig::normalize())、
+            # TSMF の各相対 TS には物理チャンネル名ではなく相対 TS ごとにユニークな channel 名 (ex: CATV_15#1) を出力する
+            # (SingleTS は TSMF 分離が不要でマージも起こらないため、従来どおり物理チャンネル名のまま)
+            channel_value = (
+                BuildMirakcTSMFChannelName(carrier.physical_channel, ts_info.tsmf_relative_ts_number)
+                if ts_info.tsmf_relative_ts_number is not None
+                else carrier.physical_channel
+            )
             channel: CATVMirakcChannel = {
                 'name': self._name(_BuildCATVChannelName(ts_info)),
                 # 再送信元に応じて BS/CS 再送信は type: BS / type: CS、それ以外は type: GR とする
                 # (cas_as_sky 指定時は C-CAS/A-CAS が必要なチャンネルのみ type: SKY になる)
                 'type': _BuildCATVChannelType(ts_info, self._cas_as_sky),
-                'channel': carrier.physical_channel,
+                'channel': channel_value,
                 'extra-args': extra_args,
                 # prefer='native' の場合、ネイティブ側と重複した CATV 再送信エントリを disable する
                 'disabled': (
@@ -1059,7 +1076,9 @@ def _BuildMirakcCardHeaderLines(detected_cards: list[DetectedCard], script_dir: 
         '#   (mirakc-core/src/command_util.rs の CommandBuilder::new())、値にスペースが含まれても壊れないよう',
         '#   上記のように各変数をシングルクォートで囲むこと (クォート自体は shell_words が解釈する)。',
         '# ※ スクリプト内の分岐は --cas-as-sky の指定有無に依存しないよう、channel_type ではなく',
-        '#   「C-CAS が必要な物理チャンネル名の明示リスト」で行っている。',
+        '#   「C-CAS が必要な channel 名の明示リスト」で行っている。TSMF 多重チャンネルは channels 側と同じ',
+        '#   相対 TS 単位のユニークな channel 名 (CATV_15#1 など) で分岐するため、同一キャリア内で B-CAS の',
+        '#   再送信 TS と C-CAS の自主放送 TS が混在していても、TS ごとに正しいリーダーが選ばれる。',
         '# ※ pcscd の SHARED 接続により 1 枚のカードを複数プロセスから同時に使えるため、複数チューナーで同時に',
         '#   デコードしてもカードの取り合いにはならない。',
     ]
@@ -1265,11 +1284,12 @@ class CATVMirakcTunersYmlFormatter:
             '#     else exec dvbv5-zap -c <生成した dvbv5_channels_catv.conf> -a 0 -P -t 0 -o - "$ch"; fi\'',
             '#     _ {{{channel}}} {{{extra_args}}}',
             '#',
-            '# ※ 上記例は、channels 側の channel を相対 TS ごとにユニークな名前 (CATV_15#1 など) へ書き換えて使うことが',
-            '#   前提。mirakc は type と channel が同じ channels エントリを 1 つにマージしてしまうため',
-            '#   (mirakc-core/src/config.rs の ChannelConfig::normalize())、同じ物理チャンネル名のままでは相対 TS を',
-            '#   1 本しか使えない。${1%%#*} が `#` 以降を落として dvbv5-zap に渡すので dvbv5 conf 側は変更不要',
-            '#   (詳細は channels_catv.yml のヘッダーコメントを参照)',
+            '# ※ 上記例の ${1%%#*} は、channels 側 (channels_catv.yml) が TSMF の相対 TS ごとに出力するユニークな',
+            '#   channel 名 (CATV_15#1 など) から `#` 以降を落として dvbv5-zap に渡すためのもの。mirakc は type と',
+            '#   channel が同じ channels エントリを 1 つにマージしてしまうため (mirakc-core/src/config.rs の',
+            '#   ChannelConfig::normalize())、同じ物理チャンネル名のままでは相対 TS を 1 本しか使えない。この',
+            '#   ユニーク化は channels 側で自動的に行われるため手作業は不要で、dvbv5 conf 側も物理チャンネル名の',
+            '#   ままでよい (詳細は channels_catv.yml のヘッダーコメントを参照)',
             '# ※ 相対 TS 番号を filters.tuner-filter 側で受け取ることはできない。tuner-filter はチューナー出力に',
             '#   decode-filter より前段で挟まるフィルタだが、渡される Mustache 変数は tuner_index / tuner_name /',
             '#   channel_name / channel_type / channel だけで extra_args は含まれない (mirakc-core/src/tuner.rs の',

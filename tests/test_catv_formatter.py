@@ -606,7 +606,7 @@ class TestCATVMirakcConfigYmlFormatterSatellite:
         assert nd02['extra-args'] == '--tsid 24608'
 
         # CATV (GR) エントリの extra-args (TSMF 相対 TS 番号) はそのまま維持されること
-        catv_15_extra_args = {channel['extra-args'] for channel in channels if channel['channel'] == 'CATV_15'}
+        catv_15_extra_args = {channel['extra-args'] for channel in channels if channel['channel'].startswith('CATV_15')}
         assert catv_15_extra_args == {'1', '2'}
 
     def test_output_identical_to_previous_without_satellite(self):
@@ -640,9 +640,61 @@ class TestCATVMirakcConfigYmlFormatterSynthetic:
         formatted_str = CATVMirakcConfigYmlFormatter(Path('unused.yml'), carriers).format()
         channels = LoadYaml(formatted_str)
 
-        catv_15_channels = {channel['extra-args']: channel for channel in channels if channel['channel'] == 'CATV_15'}
+        # channel は相対 TS ごとにユニーク化されるが、extra-args は従来どおり相対 TS 番号のまま出力される
+        catv_15_channels = {channel['extra-args']: channel for channel in channels if channel['channel'].startswith('CATV_15')}
         assert '1' in catv_15_channels
         assert '2' in catv_15_channels
+        assert catv_15_channels['1']['channel'] == 'CATV_15#1'
+        assert catv_15_channels['2']['channel'] == 'CATV_15#2'
+
+    def test_tsmf_channel_is_uniquified_and_single_ts_is_not(self):
+        carriers = BuildSyntheticCarriers()
+        formatted_str = CATVMirakcConfigYmlFormatter(Path('unused.yml'), carriers).format()
+        channels = LoadYaml(formatted_str)
+
+        # TSMF の各相対 TS は <物理チャンネル名>#<相対TS番号> に、SingleTS は物理チャンネル名のまま
+        assert {channel['channel'] for channel in channels} == {'CATV_15#1', 'CATV_15#2', 'CATV_28'}
+        # 物理チャンネル名そのままの TSMF エントリ (マージされてしまう形) が残っていないこと
+        assert all(channel['channel'] != 'CATV_15' for channel in channels)
+
+    def test_uniquified_channel_survives_yaml_round_trip(self):
+        # プレーンスカラー中の `#` がコメント扱いされず、パースし直しても値が壊れないこと
+        carriers = BuildSyntheticCarriers()
+        formatted_str = CATVMirakcConfigYmlFormatter(Path('unused.yml'), carriers).format()
+
+        assert 'CATV_15#1' in formatted_str
+        channels = LoadYaml(formatted_str)
+        rel_ts_1 = next(channel for channel in channels if channel['extra-args'] == '1')
+        assert rel_ts_1['channel'] == 'CATV_15#1'
+        assert rel_ts_1['name'] == 'サンプル放送'  # `#` 以降が切り落とされて後続キーが消えたりしていないこと
+        assert rel_ts_1['type'] == 'GR'
+        assert rel_ts_1['disabled'] is False
+
+    def test_same_type_relative_ts_channels_are_all_unique(self):
+        # 同一 type (GR) の相対 TS が複数ある場合でも channel 名が全てユニークであること
+        # (mirakc の ChannelConfig::normalize() による (type, channel) 単位のマージを避けるための回帰テスト)
+        carriers = BuildSyntheticCarriers()
+        formatted_str = CATVMirakcConfigYmlFormatter(Path('unused.yml'), carriers).format()
+        channels = LoadYaml(formatted_str)
+
+        gr_channels = [channel['channel'] for channel in channels if channel['type'] == 'GR']
+        assert len(gr_channels) == 3
+        assert len(set(gr_channels)) == len(gr_channels)
+
+        # BS/CS 再送信が混在するキャリアでも、(type, channel) の組が重複しないこと
+        formatted_str = CATVMirakcConfigYmlFormatter(Path('unused.yml'), BuildSyntheticRetransmissionCarriers()).format()
+        channels = LoadYaml(formatted_str)
+        keys = [(channel['type'], channel['channel']) for channel in channels]
+        assert len(set(keys)) == len(keys)
+
+    def test_mirakurun_channel_is_not_uniquified(self):
+        # Mirakurun は tsmfRelTs をネイティブサポートしているため、channel は物理チャンネル名のまま維持されること
+        carriers = BuildSyntheticCarriers()
+        formatted_str = CATVMirakurunChannelsYmlFormatter(Path('unused.yml'), carriers).format()
+        channels = LoadYaml(formatted_str)
+
+        assert {channel['channel'] for channel in channels} == {'CATV_15', 'CATV_28'}
+        assert all('#' not in channel['channel'] for channel in channels)
 
     def test_single_ts_extra_args_is_empty(self):
         carriers = BuildSyntheticCarriers()
@@ -850,14 +902,13 @@ class TestPreferDeduplication:
             channel['disabled'] is False for channel in channels if not channel['channel'].startswith('CATV_')
         )
         # CATV 再送信 BS (TSID 16400) は重複するため disable される
-        catv_bs = next(
-            channel for channel in channels if channel['channel'] == 'CATV_20' and channel['extra-args'] == '1'
-        )
+        # (TSMF エントリの channel は相対 TS ごとにユニーク化された名前になる)
+        catv_bs = next(channel for channel in channels if channel['channel'] == 'CATV_20#1')
+        assert catv_bs['extra-args'] == '1'
         assert catv_bs['disabled'] is True
         # CATV 再送信 CS (TSID 24608) も重複するため disable される
-        catv_cs = next(
-            channel for channel in channels if channel['channel'] == 'CATV_20' and channel['extra-args'] == '3'
-        )
+        catv_cs = next(channel for channel in channels if channel['channel'] == 'CATV_20#3')
+        assert catv_cs['extra-args'] == '3'
         assert catv_cs['disabled'] is True
         # 自主放送 (CATV_30・ネイティブに対応なし) は有効のまま
         self_broadcast = next(channel for channel in channels if channel['channel'] == 'CATV_30')

@@ -438,7 +438,8 @@ CATV スキャンは、指定されたディレクトリ以下に以下のファ
   - mirakc 用のチャンネル設定 (CATV 部分 + ネイティブ地上波/BS/CS 部分) です。
   - **mirakc は TSMF 分離に対応していない**ため、TSMF 多重チャンネルの各エントリには相対 TS 番号を `extra-args` として出力し、`isdb-tsmf-split` を組み込むためのチューナー設定例をファイル冒頭のコメントに記載しています。
     - mirakc の `tuners[].command` はシェルを介さず実行される (`shell_words` で単語分割してそのまま exec される) ため、`|` をそのまま書いてもパイプになりません。設定例では `sh -c '...'` に 1 引数としてまとめ、その中でパイプを張る形にしています。
-    - また mirakc は `type` と `channel` が同じチャンネルエントリをマージするため、TSMF 多重チャンネルは相対 TS ごとに `channel` をユニークな名前 (例: `CATV_15#1`) へ書き換えて使う必要があります (設定例のコマンドは `#` 以降を落として `dvbv5-zap` に渡すため、`dvbv5_channels_catv.conf` の書き換えは不要です)。
+    - また mirakc は `type` と `channel` が同じチャンネルエントリをマージしてしまうため、TSMF 多重チャンネルの `channel` は相対 TS ごとにユニークな名前 (例: `CATV_15#1`) として自動的に出力されます (SingleTS のチャンネルは従来どおり物理チャンネル名のままです)。そのまま `config.yml` に貼れるため、手で書き換える必要はありません。設定例のコマンドは `#` 以降を落として `dvbv5-zap` に渡すため、`dvbv5_channels_catv.conf` の書き換えも不要です。
+    - `channel` を含む mirakc の Web API (`/api/channels/<type>/<channel>/...`) を利用する場合は、URL 中の `#` を `%23` にエスケープしてください。
   - CATV エントリの `type` は Mirakurun と同様に `GR` / `BS` / `CS` (+ `--cas-as-sky` 時は `SKY`) になります。CATV チューナーの `types` にはこのファイルに現れる全 type を列挙してください。
   - ネイティブ地上波/BS/CS のスキャン (`--terrestrial` / `--satellite`) を実行した場合は、CATV エントリの後にネイティブ地上波 (`type: GR`) / BS/CS のチャンネルエントリ (recisdb で選局・`extra-args` キーで TSID 指定) も統合して出力します。
 - **Mirakurun/tuners_catv.yml / mirakc/tuners_catv.yml**
@@ -463,7 +464,7 @@ isdb-catv-scanner --list-card-readers
 
 - **Mirakurun**: Mirakurun の `decoder` はチューナー単位でしか指定できず、コマンドに引数も渡せないため、リーダー名を埋め込んだラッパースクリプト `Mirakurun/decoder-bcas.sh` / `Mirakurun/decoder-ccas.sh` を生成します。チャンネルごとの使い分けには、`--cas-as-sky` で C-CAS チャンネルを `type: SKY` に分離した上で、`decoder` に `decoder-ccas.sh` を指定した SKY 専用のチューナーエントリを追加してください (記述例は生成される `tuners_catv.yml` のコメントに記載しています)。
   - **SKY 専用エントリと B-CAS 用エントリで同じ物理アダプタを共有しないでください。** Mirakurun はチューナーエントリ間でアダプタの重複を検査しないため、同じアダプタを指す 2 つのエントリが同時に選局され、dvbv5-zap が二重起動して両方失敗することがあります。
-- **mirakc**: mirakc の `filters.decode-filter.command` はチャンネルごとにテンプレート展開されるため、生成される `mirakc/decode-filter.sh` を指定するだけでチャンネルごとの使い分けができます (`--cas-as-sky` は不要です)。組み込み例はスクリプト冒頭のコメントに記載しています。C-CAS が必要な物理チャンネルのリストはスキャン結果からスクリプトに埋め込まれるため、局側の構成変更後は再スキャンで再生成してください。
+- **mirakc**: mirakc の `filters.decode-filter.command` はチャンネルごとにテンプレート展開されるため、生成される `mirakc/decode-filter.sh` を指定するだけでチャンネルごとの使い分けができます (`--cas-as-sky` は不要です)。組み込み例はスクリプト冒頭のコメントに記載しています。C-CAS が必要なチャンネルのリストはスキャン結果からスクリプトに埋め込まれます (TSMF 多重チャンネルは `channels_catv.yml` と同じ相対 TS 単位のユニークな `channel` 名で分岐するため、同一キャリアに B-CAS 再送信と C-CAS 自主放送が混在していても TS ごとに正しいリーダーが選ばれます)。局側の構成変更後は再スキャンで再生成してください。
 
 なお、1 枚のカードは複数チューナーの同時録画で共有できます (pcsc-lite は共有モードの接続をリーダー単位で直列化するため、複数の recisdb プロセスから同じカードを同時に使っても問題ありません)。
 

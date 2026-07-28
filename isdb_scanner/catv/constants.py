@@ -420,6 +420,31 @@ def BuildDvbv5ConfEntryLines(physical_channel: str, frequency: int) -> list[str]
     ]
 
 
+def BuildMirakcTSMFChannelName(physical_channel: str, tsmf_relative_ts_number: int) -> str:
+    """
+    mirakc の channels 設定に出力する、TSMF 多重キャリアの相対 TS 1 本分のユニークな channel 名を組み立てる
+
+    mirakc は type と channel が同じ channels エントリを 1 つにマージしてしまう
+    (mirakc-core/src/config.rs の ChannelConfig::normalize()。extra-args が食い違っていても警告を出すだけで先勝ちになる)
+    ため、TSMF キャリアの各相対 TS には物理チャンネル名だけでなく相対 TS 番号まで含めたユニークな名前を割り当てる必要がある
+    `#` 区切りにしているのは、tuners[].command の例で使っている `${1%%#*}` が `#` 以降を落として dvbv5-zap に渡すため
+    (これにより dvbv5 conf 側は物理チャンネル名のままでよく、書き換えが不要になる)
+
+    この関数は mirakc 向け channels 出力 (CATVMirakcConfigYmlFormatter) と、そこに出力された channel 名で分岐する
+    decode-filter スクリプト (card_assignment.py) の双方から使い、命名規則が二重管理にならないようにしている
+    (Mirakurun は tsmfRelTs キーをネイティブサポートしているため、Mirakurun 向け出力ではこの関数を使わない)
+
+    Args:
+        physical_channel (str): 物理チャンネル名 (ex: "CATV_15")
+        tsmf_relative_ts_number (int): TSMF 多重フレーム内の相対 TS 番号 (1-15)
+
+    Returns:
+        str: ユニーク化された channel 名 (ex: "CATV_15#1")
+    """
+
+    return f'{physical_channel}#{tsmf_relative_ts_number}'
+
+
 class ChannelSummaryInfo(BaseModel):
     """スキャン差分レポートで、丸ごと追加/削除された物理チャンネル1件分の要約情報"""
 

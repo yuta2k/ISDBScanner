@@ -8,7 +8,7 @@ from isdb_scanner.catv.card_assignment import (
     MIRAKURUN_BCAS_DECODER_SCRIPT_NAME,
     MIRAKURUN_CCAS_DECODER_SCRIPT_NAME,
     CATVCardAssignmentReportFormatter,
-    CollectCCASPhysicalChannels,
+    CollectCCASMirakcChannelNames,
     DetermineDecodability,
     FindReaderNameForCardType,
     FormatDetectedCardsSummary,
@@ -197,18 +197,26 @@ class TestReaderNameLookup:
         assert GetReaderNameForRequiredCard('unknown', cards) is None
 
 
-class TestCollectCCASPhysicalChannels:
-    """C-CAS が必要な物理チャンネル一覧の収集のテスト"""
+class TestCollectCCASMirakcChannelNames:
+    """C-CAS が必要な mirakc channel 名一覧の収集のテスト"""
 
     def test_only_ccas_channels_are_collected(self):
-        assert CollectCCASPhysicalChannels(BuildSyntheticCASCarriers()) == ['CATV_21']
+        # CATV_21 は SingleTS のため物理チャンネル名がそのまま返る
+        assert CollectCCASMirakcChannelNames(BuildSyntheticCASCarriers()) == ['CATV_21']
+
+    def test_tsmf_returns_relative_ts_unique_names(self):
+        carriers = BuildSyntheticCASCarriers()
+        # TSMF キャリア (CATV_20) の相対 TS 2 のみを C-CAS にすると、その相対 TS のユニーク名だけが返ること
+        # (同一キャリアの B-CAS/none 側の相対 TS 1 は含まれない = キャリア単位より precise な粒度)
+        carriers[0].transport_streams[1].cas = CASInfo(required_card='C-CAS')
+        assert CollectCCASMirakcChannelNames(carriers) == ['CATV_20#2', 'CATV_21']
 
     def test_returns_sorted_unique_channels(self):
         carriers = BuildSyntheticCASCarriers()
-        # 同じ物理チャンネルに C-CAS の TS が 2 本あっても重複しないこと・昇順にソートされること
+        # 同じ物理チャンネルに C-CAS の TS が 2 本ある場合は相対 TS ごとに 1 件ずつ返り、昇順にソートされること
         carriers[0].transport_streams[0].cas = CASInfo(required_card='C-CAS')
         carriers[0].transport_streams[1].cas = CASInfo(required_card='C-CAS')
-        assert CollectCCASPhysicalChannels(carriers) == ['CATV_20', 'CATV_21']
+        assert CollectCCASMirakcChannelNames(carriers) == ['CATV_20#1', 'CATV_20#2', 'CATV_21']
 
     def test_no_ccas_channel_returns_empty(self):
         carriers = [
@@ -220,7 +228,7 @@ class TestCollectCCASPhysicalChannels:
                 ],
             )
         ]
-        assert CollectCCASPhysicalChannels(carriers) == []
+        assert CollectCCASMirakcChannelNames(carriers) == []
 
 
 class TestCATVCardAssignmentReportFormatter:
@@ -433,6 +441,22 @@ class TestWriteDecoderScripts:
         assert '{{{channel}}}' in script
         # --cas-as-sky に依存しない旨が書かれていること
         assert '--cas-as-sky' in script
+
+    def test_decode_filter_branches_at_relative_ts_granularity(self, tmp_path: Path):
+        # TSMF キャリアの一部の相対 TS だけが C-CAS の場合、その相対 TS のユニーク名だけが case のパターンに入ること
+        carriers = BuildSyntheticCASCarriers()
+        carriers[0].transport_streams[1].cas = CASInfo(required_card='C-CAS')
+        script_path = WriteDecoderScripts(tmp_path, carriers, [BuildBCASCard(), BuildCCASCard()])[2]
+        script = script_path.read_text(encoding='utf-8')
+
+        case_pattern_line = next(line.strip() for line in script.splitlines() if line.strip().endswith(')') and 'CATV_21' in line)
+        # `#` を含む名前はシェルのコメント扱いにならないようクォートされること
+        assert case_pattern_line == "'CATV_20#2'|CATV_21)"
+        # 同一キャリアの B-CAS/none 側の相対 TS (CATV_20#1) は含まれないこと
+        assert 'CATV_20#1' not in script
+
+        # `#` 入りのパターンを含んでいてもシェルの構文として妥当であること
+        assert subprocess.run(['sh', '-n', str(script_path)], capture_output=True).returncode == 0
 
     def test_decode_filter_without_any_ccas_channel(self, tmp_path: Path):
         # C-CAS が必要なチャンネルが 1 つも無い場合は case 分岐を生成しない (空の case は sh の構文エラーになるため)
