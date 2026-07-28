@@ -618,12 +618,19 @@ class CATVMirakcConfigYmlFormatter(CATVBaseFormatter):
     CATV キャリアのスキャン解析結果 (CATVCarrierInfo のリスト) から mirakc 用の channels 設定断片 (CATV 分) を生成するフォーマッター
 
     mirakc は Mirakurun の tsmfRelTs のようなネイティブ TSMF 分離機能を持たないため、TSMF キャリアの各相対 TS を
-    単一の TS として扱うには、選局コマンドの標準出力を `isdb-tsmf-split --rel-ts <N>` にパイプして分離する必要がある
+    単一の TS として扱うには、選局コマンドの標準出力を `isdb-tsmf-split --rel-ts <N>` に通して分離する必要がある
     mirakc の tuner.command は Mustache テンプレートで channels 側の `channel` / `extra-args` を
     `{{{channel}}}` / `{{{extra_args}}}` に埋め込む方式 (既存 MirakcConfigYmlFormatter が BS の --tsid 指定に
     使っているのと同じ仕組み) のため、本フォーマッターでは TSMF の各エントリの extra-args に相対 TS 番号を
     設定し、tuners 側のコマンドテンプレートで isdb-tsmf-split に渡す運用を想定する
     (SingleTS のエントリは extra-args が空文字列になるため、isdb-tsmf-split を挟まずそのまま使われる想定)
+
+    ただし mirakc の tuners[].command はシェルを介さず exec されるため (mirakc-core/src/command_util.rs の
+    CommandBuilder::new() が shell_words::split() で単語分割し Command::new(prog).args(args) を実行する)、
+    command に `|` をそのまま書いてもパイプにはならない。パイプを張るには command 全体を `sh -c '...'` の
+    1 引数にまとめる必要があり、さらに mirakc は type と channel が同じ channels エントリをマージするため
+    (mirakc-core/src/config.rs の ChannelConfig::normalize())、相対 TS ごとに channel をユニークな名前に
+    書き換えて使う必要がある。これらの検証結果と具体的な組み込み方はヘッダーコメントに書き出す
 
     完全な mirakc の config.yml 全体ではなく、channels 部分の断片 + 運用方法の説明コメントのみを出力する
     (tuners 側の具体的な command テンプレートは環境 (アダプタ数・isdb-tsmf-split の組み込み方) によって変わるため、
@@ -693,21 +700,50 @@ class CATVMirakcConfigYmlFormatter(CATVBaseFormatter):
             '#',
             '# mirakc は Mirakurun の tsmfRelTs のようなネイティブ TSMF 分離機能を持たないため、TSMF キャリアの',
             '# 各相対 TS を単一の TS として扱うには、選局コマンドの標準出力を `isdb-tsmf-split --rel-ts <N>` に',
-            '# パイプする必要がある。以下の channels 断片では、TSMF の各エントリの extra-args に相対 TS 番号',
-            '# (1-15) を設定しているので、config.yml の tuners セクションのコマンドテンプレートで',
-            '# {{{extra_args}}} を isdb-tsmf-split --rel-ts に渡すこと。tuners セクションのコマンド例:',
+            '# 通す必要がある。以下の channels 断片では、TSMF の各エントリの extra-args に相対 TS 番号 (1-15) を',
+            '# 出力している。組み込み方は mirakc 本体のソースを確認した上で、以下の 1) 2) の手順に整理している。',
             '#',
-            '#   tuners:',
-            '#     - name: CATV Tuner (adapter0)',
-            '#       types: ["GR", "BS", "CS"]',
-            '#       command: >-',
-            '#         dvbv5-zap -c <生成した dvbv5_channels_catv.conf> -a 0 -P -t 0 -o - {{{channel}}}',
-            '#         {{#extra_args}}| isdb-tsmf-split --rel-ts {{{extra_args}}}{{/extra_args}}',
+            '# 1) 相対 TS ごとに channel をユニークな名前に書き換える',
+            '#    mirakc は type と channel が同じ channels エントリを 1 つにマージし、extra-args が食い違っていても',
+            '#    警告を出すだけで先勝ちになる (mirakc-core/src/config.rs の ChannelConfig::normalize() と',
+            '#    impl PartialEq for ChannelConfig)。mirakc-core/src/tuner.rs の TunerSession::is_reuseable() も',
+            '#    channel_type と channel だけでチューナーセッションの再利用を判定する。このため下記の TSMF エントリ',
+            '#    (channel が同じで extra-args だけが異なる) をそのまま config.yml に貼ると、1 本の相対 TS しか',
+            '#    使えない。channel を CATV_15#1 / CATV_15#2 のように相対 TS ごとにユニークな名前へ書き換えること',
+            '#    (下記 command 例の ${1%%#*} が `#` 以降を落として dvbv5-zap に渡すため、dvbv5 conf 側は変更不要)。',
+            '#    decode-filter.sh を併用する場合は、スクリプト内の case のパターンも書き換えた channel 名に合わせること。',
             '#',
-            '# ※ mirakc の Mustache 実装が上記のような条件セクション ({{#...}}...{{/...}}) 構文をサポートして',
-            '#   いるかは未検証のため、実運用では SingleTS 用と TSMF 用でチューナー (アダプタ) 自体を分ける、',
-            '#   あるいは `| isdb-tsmf-split --rel-ts N` を固定で埋め込んだチューナーを channel 数だけ用意する',
-            '#   など、環境に応じた組み込み方を検討すること (extra-args の値自体は正しい相対 TS 番号を示す)',
+            '# 2) tuners[].command は `sh -c` にまとめてシェル側でパイプを張る',
+            '#    mirakc はレンダリング結果をシェルに渡さず、shell_words で単語分割してそのまま exec する',
+            '#    (mirakc-core/src/command_util.rs の CommandBuilder::new())。このため command に `|` を書いても',
+            '#    パイプにはならず、`|` が dvbv5-zap の引数として渡ってしまう。シングルクォートは shell_words が',
+            "#    解釈するので、`sh -c '...'` の形にまとめればシェル側でパイプを張れる。tuners のコマンド例:",
+            '#',
+            '#      tuners:',
+            '#        - name: CATV Tuner (adapter0)',
+            '#          types: ["GR", "BS", "CS"]',
+            '#          command: >-',
+            '#            sh -c \'ch=${1%%#*}; if [ -n "$2" ];',
+            '#            then dvbv5-zap -c <生成した dvbv5_channels_catv.conf> -a 0 -P -t 0 -o - "$ch" | isdb-tsmf-split --rel-ts "$2";',
+            '#            else exec dvbv5-zap -c <生成した dvbv5_channels_catv.conf> -a 0 -P -t 0 -o - "$ch"; fi\'',
+            '#            _ {{{channel}}} {{{extra_args}}}',
+            '#',
+            '#    SingleTS のエントリは extra-args が空文字列になり $2 が空になるため、isdb-tsmf-split を挟まない側の',
+            '#    分岐が exec される (exec なので余計なプロセスは残らない)。',
+            '#',
+            '# ※ Mustache のセクション ({{#extra_args}}...{{/extra_args}}) 自体は mirakc が使う mustache 0.9 でも動作し、',
+            '#   extra-args が空文字列ならセクション内は展開されない (rust-mustache の template.rs render_section() の',
+            '#   Data::String 分岐)。ただし上記のとおり `|` がパイプにならないため、セクションでパイプを出し分けても無意味',
+            '# ※ チューナー出力全体に別プロセスを挟む口としては filters.tuner-filter がある (config.rs の',
+            '#   FiltersConfig::tuner_filter)。tuner.rs の TunerSession::new() が [チューナーコマンド, tuner-filter] を',
+            '#   1 本のパイプラインとして spawn するため decode-filter より必ず前段になり、TSMF 分離 → B25 復号という',
+            '#   順序自体は満たせるが、tuner-filter に渡る Mustache 変数は tuner_index / tuner_name / channel_name /',
+            '#   channel_type / channel だけで extra_args は渡らない (tuner.rs の TunerManager::make_filter_command() と',
+            '#   mirakc の docs/config.md のフィルタ別テンプレート変数対応表)。相対 TS 番号を渡せないため今回は使わない',
+            '# ※ mirakc はチューナー停止時、パイプラインの直下の子プロセスにしか SIGKILL を送らない',
+            '#   (command_util.rs の CommandPipeline::kill())。`sh -c` の中のパイプ (dvbv5-zap / isdb-tsmf-split) は',
+            '#   sh の子プロセスなので、mirakc が出力パイプを閉じたあとの SIGPIPE で終了する。ストリームが停止したまま',
+            '#   kill された場合にプロセスが残らないか (チューナーが掴まれたままにならないか) は実機で確認しておくこと',
             '#',
             '# BS/CS 再送信 (トランスモジュレーション) のチャンネルは type: BS / type: CS として出力されるため、',
             '# CATV チューナーの types にはこのファイルに現れる全 type (GR/BS/CS、--cas-as-sky 使用時は SKY も) を',
@@ -1155,9 +1191,12 @@ class CATVMirakcTunersYmlFormatter:
 
     CATV チューナーは dvbv5-zap で、ISDB-T/ISDB-S チューナーは recisdb で選局する。
     mirakc は Mirakurun の tsmfRelTs のようなネイティブ TSMF 分離機能を持たないため、TSMF キャリアの相対 TS を
-    単一 TS として扱うには、CATV チューナーの選局コマンドの標準出力を `isdb-tsmf-split --rel-ts {{{extra_args}}}` に
-    パイプする必要がある (channels 側の extra-args に相対 TS 番号を出力している)。ここでは基本形の command のみを
-    出力し、isdb-tsmf-split の組み込み方はヘッダーコメントの例として示すに留める
+    単一 TS として扱うには、CATV チューナーの選局コマンドの標準出力を `isdb-tsmf-split --rel-ts <N>` に通す必要がある
+    (channels 側の extra-args に相対 TS 番号を出力している)。mirakc の tuners[].command はシェルを介さず exec される
+    (mirakc-core/src/command_util.rs の CommandBuilder::new() が shell_words::split() で単語分割してから
+    Command::new(prog).args(args) を実行する) ため、command に `|` を書いてもパイプにはならず、`sh -c '...'` の
+    1 引数にまとめてシェル側でパイプを張る必要がある。ここでは基本形 (isdb-tsmf-split を挟まない) の command のみを
+    出力し、TSMF 対応の組み込み方はヘッダーコメントの例として示すに留める
 
     detected_cards (カード在庫) が渡された場合は、ヘッダーコメントにカード構成に応じた decode-filter の
     組み込み例を追記する (省略時 (None) の出力は従来と完全に同一)
@@ -1214,16 +1253,28 @@ class CATVMirakcTunersYmlFormatter:
             '#',
             '# mirakc は Mirakurun の tsmfRelTs のようなネイティブ TSMF 分離機能を持たないため、TSMF キャリアの',
             '# 各相対 TS を単一の TS として扱うには、CATV チューナーの選局コマンドの標準出力を',
-            '# `isdb-tsmf-split --rel-ts {{{extra_args}}}` にパイプする必要がある。command の例:',
+            '# `isdb-tsmf-split --rel-ts <N>` に通す必要がある。ただし mirakc はレンダリング結果をシェルに渡さず、',
+            '# shell_words で単語分割してそのまま exec するため (mirakc-core/src/command_util.rs の',
+            '# CommandBuilder::new())、command に `|` を書いてもパイプにはならず `|` が dvbv5-zap の引数として',
+            "# 渡ってしまう。シングルクォートは shell_words が解釈するので、`sh -c '...'` の 1 引数にまとめれば",
+            '# シェル側でパイプを張れる。TSMF (extra-args あり) のときだけ分離を挟む command の例:',
             '#',
             '#   command: >-',
-            '#     dvbv5-zap -c <生成した dvbv5_channels_catv.conf> -a 0 -P -t 0 -o - {{{channel}}}',
-            '#     {{#extra_args}}| isdb-tsmf-split --rel-ts {{{extra_args}}}{{/extra_args}}',
+            '#     sh -c \'ch=${1%%#*}; if [ -n "$2" ];',
+            '#     then dvbv5-zap -c <生成した dvbv5_channels_catv.conf> -a 0 -P -t 0 -o - "$ch" | isdb-tsmf-split --rel-ts "$2";',
+            '#     else exec dvbv5-zap -c <生成した dvbv5_channels_catv.conf> -a 0 -P -t 0 -o - "$ch"; fi\'',
+            '#     _ {{{channel}}} {{{extra_args}}}',
             '#',
-            '# ※ mirakc の Mustache 実装が上記のような条件セクション ({{#...}}...{{/...}}) 構文をサポートして',
-            '#   いるかは未検証のため、実運用では SingleTS 用と TSMF 用でチューナー (アダプタ) 自体を分ける、',
-            '#   あるいは `| isdb-tsmf-split --rel-ts N` を固定で埋め込んだチューナーを channel 数だけ用意する',
-            '#   など、環境に応じた組み込み方を検討すること (以下の command は isdb-tsmf-split を挟まない基本形)',
+            '# ※ 上記例は、channels 側の channel を相対 TS ごとにユニークな名前 (CATV_15#1 など) へ書き換えて使うことが',
+            '#   前提。mirakc は type と channel が同じ channels エントリを 1 つにマージしてしまうため',
+            '#   (mirakc-core/src/config.rs の ChannelConfig::normalize())、同じ物理チャンネル名のままでは相対 TS を',
+            '#   1 本しか使えない。${1%%#*} が `#` 以降を落として dvbv5-zap に渡すので dvbv5 conf 側は変更不要',
+            '#   (詳細は channels_catv.yml のヘッダーコメントを参照)',
+            '# ※ 相対 TS 番号を filters.tuner-filter 側で受け取ることはできない。tuner-filter はチューナー出力に',
+            '#   decode-filter より前段で挟まるフィルタだが、渡される Mustache 変数は tuner_index / tuner_name /',
+            '#   channel_name / channel_type / channel だけで extra_args は含まれない (mirakc-core/src/tuner.rs の',
+            '#   TunerManager::make_filter_command() と mirakc の docs/config.md のフィルタ別対応表で確認済み)',
+            '# ※ 以下に出力している command は isdb-tsmf-split を挟まない基本形 (SingleTS のみの環境ならこのままで良い)',
             '#',
             '# `-t 0` は録画時間 0 秒 (dvbv5-zap 自身のタイムアウトに委ねず、mirakc 側がプロセスの生存期間を',
             '# 管理する) を意図した値だが、dvbv5-zap の `-t` はロックタイムアウトと録画時間を兼ねる特殊仕様のため、',

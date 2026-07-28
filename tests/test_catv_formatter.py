@@ -1033,7 +1033,11 @@ class TestCATVTunersYmlFormatterCardAssignment:
             ['GR', 'SKY'],
         ).format()
         assert self._MirakcFormat(None) == mirakc_omitted
-        assert 'decode-filter' not in mirakc_omitted
+        # filters.decode-filter の設定例 (decode-filter: / decode-filter.sh) は一切出力されないこと
+        ## ヘッダーコメントには TSMF 分離の説明として decode-filter という語自体は登場するため、
+        ## カード関連コメントの有無は設定キー・スクリプト名の形で判定する
+        assert 'decode-filter:' not in mirakc_omitted
+        assert 'decode-filter.sh' not in mirakc_omitted
         assert 'CAS カード' not in mirakc_omitted
 
     def test_bcas_only_uses_arib_b25_stream_test(self):

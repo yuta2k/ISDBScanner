@@ -436,7 +436,9 @@ CATV スキャンは、指定されたディレクトリ以下に以下のファ
   - ネイティブ地上波/BS/CS のスキャン (`--terrestrial` / `--satellite`) を実行した場合は、CATV エントリの後にネイティブ地上波 (`type: GR`) / BS/CS のチャンネルエントリ (recisdb で選局・`satellite` キーで TSID 指定) も統合して出力します。ISDB-T/ISDB-S チューナー用の `tuners.yml` の記述例もファイル冒頭のコメントに記載しています。
 - **mirakc/channels_catv.yml**
   - mirakc 用のチャンネル設定 (CATV 部分 + ネイティブ地上波/BS/CS 部分) です。
-  - **mirakc は TSMF 分離に対応していない**ため、チューナーコマンドのパイプに `isdb-tsmf-split --rel-ts <番号>` を挟む形の設定例を出力します。
+  - **mirakc は TSMF 分離に対応していない**ため、TSMF 多重チャンネルの各エントリには相対 TS 番号を `extra-args` として出力し、`isdb-tsmf-split` を組み込むためのチューナー設定例をファイル冒頭のコメントに記載しています。
+    - mirakc の `tuners[].command` はシェルを介さず実行される (`shell_words` で単語分割してそのまま exec される) ため、`|` をそのまま書いてもパイプになりません。設定例では `sh -c '...'` に 1 引数としてまとめ、その中でパイプを張る形にしています。
+    - また mirakc は `type` と `channel` が同じチャンネルエントリをマージするため、TSMF 多重チャンネルは相対 TS ごとに `channel` をユニークな名前 (例: `CATV_15#1`) へ書き換えて使う必要があります (設定例のコマンドは `#` 以降を落として `dvbv5-zap` に渡すため、`dvbv5_channels_catv.conf` の書き換えは不要です)。
   - CATV エントリの `type` は Mirakurun と同様に `GR` / `BS` / `CS` (+ `--cas-as-sky` 時は `SKY`) になります。CATV チューナーの `types` にはこのファイルに現れる全 type を列挙してください。
   - ネイティブ地上波/BS/CS のスキャン (`--terrestrial` / `--satellite`) を実行した場合は、CATV エントリの後にネイティブ地上波 (`type: GR`) / BS/CS のチャンネルエントリ (recisdb で選局・`extra-args` キーで TSID 指定) も統合して出力します。
 - **Mirakurun/tuners_catv.yml / mirakc/tuners_catv.yml**

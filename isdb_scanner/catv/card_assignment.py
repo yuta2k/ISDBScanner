@@ -432,6 +432,11 @@ def BuildMirakcDecodeFilterScript(bcas_reader_name: str, ccas_reader_name: str, 
         '# 依存しないよう、channel_type ではなく「C-CAS が必要な物理チャンネル名の明示リスト」で行う。',
         '# 下記のリストは、スキャン結果のうち required_card == "C-CAS" の TS が多重されていた物理チャンネル。',
         '#',
+        '# ※ mirakc は type と channel が同じ channels エントリをマージしてしまうため、TSMF 多重チャンネルは',
+        '#   相対 TS ごとに channel をユニークな名前 (例: CATV_15#1) へ書き換えて使う必要がある',
+        '#   (channels_catv.yml のヘッダーコメント参照)。書き換えた場合は、下記 case のパターンも',
+        '#   その名前に合わせて追記すること (このスクリプトには $3 = channel の値がそのまま渡るため)。',
+        '#',
     ]
     lines.extend(RECISDB_DECODE_ARGUMENT_REFERENCE_LINES)
     lines.extend(
