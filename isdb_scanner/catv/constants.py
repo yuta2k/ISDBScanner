@@ -37,15 +37,69 @@ RequiredCASCard = Literal['none', 'B-CAS', 'C-CAS', 'A-CAS', 'unknown']
 # 再送信元 (地上波・BS・CS の再送信か、CATV 事業者による自主放送か) の種別
 RetransmissionSource = Literal['BS', 'Terrestrial', 'CS', 'SelfBroadcast', 'Unknown']
 
-# CA_system_id (ARIB STD-B10 第2部 6.3.68 参照) からカード種別への対応表
-# 0x0005 は ARIB STD-B25 で規定された ARIB 統一 CAS の CA_system_id で、地上波/BS/CS110 の B-CAS カードと
-# 4K/8K 放送の A-CAS カードの双方で共通して使われている (TS キャリアか TLV/MMT キャリアかのコンテナ種別で B-CAS/A-CAS を区別する)
-# 0x0006 は CATV 業界の C-CAS で使われていると実データ (複数の CATV ダンプで確認済み) から推測されるが、
-# JCTEA STD-007 などの規格書による裏取りは未了のため、暫定的な対応とする
+# CA_system_id (ARIB STD-B10 第2部 6.3.68 参照) から限定受信方式の表示名への対応表
+# 出典: ARIB STD-B10 付録M 表M-1「限定受信方式識別の割当」(確定情報)
+# - いわゆる「C-CAS」は単一の方式ではなく、0x0003 (日立方式) / 0x0004 (Secure Navi 方式) / 0x0006 (松下 CATV 限定受信方式) の
+#   3 方式の総称である。3 方式とも運用規定は同じ JCL SPEC-005 (JC-HITS トランスモジュレーション運用仕様) で、
+#   CATV 事業者ごとにどの方式を採用しているかが異なる
+# - 0x0005「ARIB 限定受信方式」(運用規定: ARIB TR-B14 / TR-B15) は B-CAS カードと A-CAS カードの双方が該当する。
+#   ARIB TR-B39 表8-2 により、高度BS (network_id 0x000B) / 高度広帯域CS (network_id 0x000C) の限定受信方式識別も同じ 0x0005 のため、
+#   CA_system_id だけでは B-CAS/A-CAS を区別できず、TS キャリアか TLV/MMT キャリアかのコンテナ種別で区別する必要がある
+# - 0x0007「ケーブルラボ視聴制御方式」は運用規定が JCL SPEC-001-01「不正使用防止機能詳細仕様」であることから、
+#   コンテンツのスクランブルではなく STB 側の視聴制御レイヤであると推測される (推測であり確定情報ではない)
+# - 注意: DVB の CA_system_id レジストリでは 0x0005/0x0006 が OMA BCAST に割り当てられており、日本の割当と衝突している。
+#   このため tsduck などの汎用ツールが表示する方式名をそのまま流用してはならない
 CA_SYSTEM_ID_NAMES: dict[int, str] = {
-    0x0005: 'B-CAS',
-    0x0006: 'C-CAS',
+    0x0001: 'SKY Perfect Communications (スカパー)',
+    0x0003: 'C-CAS (日立方式)',
+    0x0004: 'C-CAS (Secure Navi 方式)',
+    0x0005: 'B-CAS/A-CAS (ARIB 限定受信方式)',
+    0x0006: 'C-CAS (松下 CATV 限定受信方式)',
+    0x0007: 'ケーブルラボ視聴制御方式',
+    0x0008: 'u-CAS',
+    0x0009: 'PowerKEY',
+    0x000A: 'ARIB 限定受信方式 B',
+    0x000E: 'ARIB コンテンツ保護方式',
+    0x000F: 'ConPas 方式',
+    0x0010: 'MULTI2-NAGRA (Merlin) 方式',
 }
+
+# ARIB 限定受信方式 (ARIB STD-B10 付録M 表M-1) の CA_system_id
+# B-CAS カード (地上波/BS/CS110) と A-CAS カード (4K/8K 放送) で共通のため、この ID だけではカード種別を確定できない
+ARIB_CAS_SYSTEM_ID: int = 0x0005
+
+# いわゆる「C-CAS」に該当する CA_system_id の集合 (ARIB STD-B10 付録M 表M-1)
+# 0x0003 (日立方式) / 0x0004 (Secure Navi 方式) / 0x0006 (松下 CATV 限定受信方式) の 3 方式はいずれも
+# 運用規定が JCL SPEC-005 (JC-HITS トランスモジュレーション運用仕様) で、CATV 事業者が配布する C-CAS カードで受信する
+C_CAS_SYSTEM_IDS: frozenset[int] = frozenset({0x0003, 0x0004, 0x0006})
+
+# コンテンツのスクランブルではなく、STB 側の視聴制御レイヤであると推測される CA_system_id の集合
+# 0x0007「ケーブルラボ視聴制御方式」は運用規定が JCL SPEC-001-01「不正使用防止機能詳細仕様」であることから
+# 視聴制御レイヤと推測されるため、C-CAS カードの要否判定には使わない (あくまで推測であり確定情報ではない)
+VIEWING_CONTROL_ONLY_SYSTEM_IDS: frozenset[int] = frozenset({0x0007})
+
+
+def GetCASystemName(ca_system_id: int) -> str:
+    """
+    CA_system_id に対応する限定受信方式の表示名を取得する
+    ARIB STD-B10 付録M 表M-1 に割当のない値は 'Unknown (0x00XX)' 形式にフォールバックする
+    """
+
+    return CA_SYSTEM_ID_NAMES.get(ca_system_id, f'Unknown (0x{ca_system_id:04X})')
+
+
+# network_id (ARIB STD-B10 付録N「ネットワーク識別の割当」) のうち、CATV 関連の割当
+# CATV 事業者の地デジ網内自主放送 (運用規定: JCL SPEC-006 (パススルー) / JCL SPEC-007 (トランスモジュレーション))
+# この範囲は地上波再送信の network_id 範囲 (0x7880-0x7FE8) に完全に内包されているため、地上波判定より先に判定する必要がある
+NETWORK_ID_CATV_SELF_BROADCAST_RANGE: tuple[int, int] = (0x7C1F, 0x7F5F)
+# デジアナ変換 (運用規定: JCL SPEC-008)
+NETWORK_ID_DIGITAL_ANALOG_CONVERSION: int = 0xFFFC
+# JC-HITS トランスモジュレーション (運用規定: JCL SPEC-005)
+NETWORK_ID_JC_HITS_TRANSMODULATION: int = 0xFFFD
+# Digital broadcasting ReMUX (運用規定: JCL SPEC-003 / JCL SPEC-004)
+NETWORK_ID_DIGITAL_BROADCASTING_REMUX: int = 0xFFFE
+# 鹿児島ケーブルテレビ (独自規定)
+NETWORK_ID_KAGOSHIMA_CATV: int = 0xFFFF
 
 
 class CASInfo(BaseModel):
@@ -56,6 +110,9 @@ class CASInfo(BaseModel):
     scramble_ratio: float = 0.0                  # TS パケットのうちスクランブルされているものの割合 (0.0-1.0)
     has_free_ca_mode_service: bool = False       # SDT で free_CA_mode (有料放送を示すフラグ) が立っているサービスが1つでもあるか
     required_card: RequiredCASCard = 'unknown'   # 受信に必要な CAS カードの種別
+    ca_system_names: list[str] = []              # ca_system_ids と同じ並び順の限定受信方式の表示名 (CA_SYSTEM_ID_NAMES 由来)
+                                                  # 未知の CA_system_id は 'Unknown (0x00XX)' 形式にフォールバックする
+                                                  # (JSON 互換性のため、既存フィールドの順序は変えずに末尾に追加している)
     # fmt: on
 
 

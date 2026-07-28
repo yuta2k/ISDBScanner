@@ -5,6 +5,11 @@ from rich import print
 from isdb_scanner.analyzer import TransportStreamAnalyzer
 from isdb_scanner.catv.cas import AnalyzeCAS, ExtractSDTFreeCAModeMap, ParsePAT
 from isdb_scanner.catv.constants import (
+    NETWORK_ID_CATV_SELF_BROADCAST_RANGE,
+    NETWORK_ID_DIGITAL_ANALOG_CONVERSION,
+    NETWORK_ID_DIGITAL_BROADCASTING_REMUX,
+    NETWORK_ID_JC_HITS_TRANSMODULATION,
+    NETWORK_ID_KAGOSHIMA_CATV,
     CarrierType,
     CATVCarrierInfo,
     CATVServiceInfo,
@@ -157,7 +162,15 @@ class CATVCarrierAnalyzer:
     def __determineRetransmissionSource(network_id: int | None, *, nit_analyzed: bool) -> RetransmissionSource:
         """
         network_id (NIT から取得した自 TS のネットワーク ID) から再送信元を判定する
+        network_id の割当は ARIB STD-B10 付録N「ネットワーク識別の割当」に基づく
         ref: isdb_scanner/constants.py の TransportStreamInfo.broadcast_type (地上波/BS/CS の network_id 範囲判定ロジック)
+
+        判定順序が重要な点に注意:
+        CATV 事業者の地デジ網内自主放送の範囲 (0x7C1F-0x7F5F) は地上波再送信の範囲 (0x7880-0x7FE8) に完全に内包されているため、
+        必ず CATV 自主放送の判定を地上波の判定より先に行う必要がある
+
+        どの運用規定に該当するかは RetransmissionSource の Literal 値では表現しない (formatter/diff への波及を避けるため) が、
+        network_id 自体は CATV.json に出力されるため、下記コメントの対応表で判別できる
         """
 
         if not nit_analyzed:
@@ -168,10 +181,25 @@ class CATVCarrierAnalyzer:
             # CATV 事業者が地上波/BS/CS のいずれの中継でもない独自のチャンネルを多重している (自主放送) 可能性が高い
             return 'SelfBroadcast'
         if network_id == 0x0004:
+            # BS デジタル放送 (ARIB STD-B10 付録N)
             return 'BS'
         if network_id in (0x0006, 0x0007):
+            # 広帯域CSデジタル放送 (CS110: 0x0006 = SKY PerfecTV!、0x0007 = 旧 e2) (ARIB STD-B10 付録N)
             return 'CS'
+        if NETWORK_ID_CATV_SELF_BROADCAST_RANGE[0] <= network_id <= NETWORK_ID_CATV_SELF_BROADCAST_RANGE[1]:
+            # 0x7C1F-0x7F5F: CATV 事業者の地デジ網内自主放送 (運用規定: JCL SPEC-006 (パススルー) / JCL SPEC-007 (トランスモジュレーション))
+            # 地上波再送信の範囲に内包されているため、必ず下の地上波判定より先に判定する
+            return 'SelfBroadcast'
         if 0x7880 <= network_id <= 0x7FE8:
+            # 0x7880-0x7FE8: 地上デジタルテレビジョン放送 (ARIB STD-B10 付録N) の再送信
             return 'Terrestrial'
+        if network_id in (
+            NETWORK_ID_DIGITAL_ANALOG_CONVERSION,  # 0xFFFC: デジアナ変換 (運用規定: JCL SPEC-008)
+            NETWORK_ID_JC_HITS_TRANSMODULATION,  # 0xFFFD: JC-HITS トランスモジュレーション (運用規定: JCL SPEC-005)
+            NETWORK_ID_DIGITAL_BROADCASTING_REMUX,  # 0xFFFE: Digital broadcasting ReMUX (運用規定: JCL SPEC-003 / JCL SPEC-004)
+            NETWORK_ID_KAGOSHIMA_CATV,  # 0xFFFF: 鹿児島ケーブルテレビ (独自規定)
+        ):
+            # いずれも CATV 事業者が自網内で運用するネットワークのため、自主放送として扱う
+            return 'SelfBroadcast'
         # 既知の範囲に当てはまらない network_id: NIT 自体は取得できているので、TS 自体は正常だが再送信元は特定できない
         return 'SelfBroadcast'

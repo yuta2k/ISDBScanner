@@ -2,17 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from isdb_scanner.catv.constants import CA_SYSTEM_ID_NAMES, CASInfo
+from isdb_scanner.catv.constants import ARIB_CAS_SYSTEM_ID, C_CAS_SYSTEM_IDS, CASInfo, GetCASystemName
 from isdb_scanner.catv.tsmf import TS_PACKET_SIZE, TS_SYNC_BYTE, GetPID
 
 
 # CA 記述子のタグ値 (ARIB STD-B10 第2部 6.2.5)
 CA_DESCRIPTOR_TAG = 0x09
 # スクランブル判定の閾値 (この割合未満なら「実質スクランブルされていない」とみなす)
+# ARIB TR-B14 4.3 の明文規定「受信側でのコンポーネントのスクランブルモードの判定は TS パケットヘッダ中 (transport_scrambling_control) で行う」に従い、
+# スクランブルされているかどうかは TS パケットヘッダの transport_scrambling_control のみから判定する
 SCRAMBLE_RATIO_NONE_THRESHOLD = 0.01
-
-# カード種別名 → CA_system_id の逆引き (constants.py の CA_SYSTEM_ID_NAMES を単一の情報源とする)
-_CA_SYSTEM_ID_BY_NAME = {name: ca_system_id for ca_system_id, name in CA_SYSTEM_ID_NAMES.items()}
 
 # MPEG-2 PSI の CRC32 (CRC-32/MPEG-2: 反転なし・初期値 0xFFFFFFFF・xorout 0x00000000) の生成多項式
 _CRC32_MPEG_POLYNOMIAL = 0x04C11DB7
@@ -220,6 +219,8 @@ def AnalyzeCAS(
 
     # スクランブル率の集計 (transport_scrambling_control (先頭から4バイト目の上位2bit) が 0 以外の割合) と、
     # 対象 PID のパケット収集を 1 回の走査で同時に行う
+    # ARIB TR-B14 4.3 の明文規定により、コンポーネントのスクランブル有無の判定は TS パケットヘッダ中の
+    # transport_scrambling_control で行うと定められているため、SDT の free_CA_mode ではなくこちらを使う
     total_packet_count = 0
     scrambled_packet_count = 0
     pid_streams: dict[int, bytearray] = {pid: bytearray() for pid in target_pids}
@@ -240,24 +241,35 @@ def AnalyzeCAS(
 
     if free_ca_mode_map is None:
         free_ca_mode_map = ExtractSDTFreeCAModeMap(pid_streams[0x0011])
+    # ARIB TR-B14 4.3 の明文規定「free_CA_mode に関しては有料か無料かの判定目的だけとし、
+    # スクランブル／ノンスクランブルの判定を有料・無料の判定に用いてはならない」に従い、
+    # free_CA_mode は有料放送かどうかの情報 (has_free_ca_mode_service) にのみ使い、カード種別の判定には使わない
     has_free_ca_mode_service = any(not is_free for is_free in free_ca_mode_map.values())
 
-    # 受信に必要な CAS カードの種別を判定する (CA_system_id とカード名の対応は constants.py の CA_SYSTEM_ID_NAMES を参照)
+    # 受信に必要な CAS カードの種別を判定する (CA_system_id の割当は ARIB STD-B10 付録M 表M-1 / constants.py を参照)
     if scramble_ratio < SCRAMBLE_RATIO_NONE_THRESHOLD:
         # ほぼスクランブルされていない = 無料放送のみでカード不要
         required_card = 'none'
-    elif _CA_SYSTEM_ID_BY_NAME['C-CAS'] in ca_system_ids:
-        # C-CAS と B-CAS の両方が見つかった場合は、CATV 事業者による再スクランブルの可能性が高い C-CAS を優先する
+    elif not C_CAS_SYSTEM_IDS.isdisjoint(ca_system_ids):
+        # 0x0003 (日立方式) / 0x0004 (Secure Navi 方式) / 0x0006 (松下 CATV 限定受信方式) のいずれかがあれば C-CAS が必要
+        # C-CAS 系と ARIB 限定受信方式 (0x0005) の両方が見つかった場合は、
+        # CATV 事業者による再スクランブルの可能性が高い C-CAS を優先する
         required_card = 'C-CAS'
-    elif _CA_SYSTEM_ID_BY_NAME['B-CAS'] in ca_system_ids:
+    elif ARIB_CAS_SYSTEM_ID in ca_system_ids:
+        # ARIB 限定受信方式 (0x0005) は B-CAS カードと A-CAS カードの双方が該当するが、
+        # ここでは TS キャリア (MPEG-2 TS コンテナ) の解析結果なので B-CAS と判定する
+        # (TLV/MMT キャリアの 4K/8K 放送は A-CAS だが、そちらはこの関数を通らない)
         required_card = 'B-CAS'
     else:
         # スクランブルされているが CA 記述子が見つからない、または未知の CA_system_id しかない場合
+        # (0x0007 ケーブルラボ視聴制御方式のみが見つかった場合も、コンテンツのスクランブル方式ではないと推測されるためここに落ちる)
         required_card = 'unknown'
 
+    sorted_ca_system_ids = sorted(ca_system_ids)
     return CASInfo(
-        ca_system_ids=sorted(ca_system_ids),
+        ca_system_ids=sorted_ca_system_ids,
         scramble_ratio=scramble_ratio,
         has_free_ca_mode_service=has_free_ca_mode_service,
         required_card=required_card,
+        ca_system_names=[GetCASystemName(ca_system_id) for ca_system_id in sorted_ca_system_ids],
     )

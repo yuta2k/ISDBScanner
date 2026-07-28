@@ -1,5 +1,5 @@
 from isdb_scanner.catv.analyzer import CATVCarrierAnalyzer
-from isdb_scanner.catv.constants import CarrierType
+from isdb_scanner.catv.constants import CarrierType, RetransmissionSource
 from isdb_scanner.catv.tsmf import NULL_PID, TS_PACKET_SIZE, TS_SYNC_BYTE, TSMF_SLOT_COUNT
 from tests.test_cas import (
     BuildCATSection,
@@ -30,6 +30,14 @@ def BuildSingleTSPackets(
     for i in range(scrambled_count):
         stream += BuildElementaryStreamPacket(0x0101, scrambled=True, continuity_counter=i)
     return stream
+
+
+def DetermineRetransmissionSource(network_id: int | None, *, nit_analyzed: bool = True) -> RetransmissionSource:
+    """テスト用に、private static メソッドの __determineRetransmissionSource を名前マングリング経由で呼び出す"""
+
+    return CATVCarrierAnalyzer._CATVCarrierAnalyzer__determineRetransmissionSource(  # type: ignore[attr-defined]
+        network_id, nit_analyzed=nit_analyzed
+    )
 
 
 def BuildNullPacket() -> bytes:
@@ -107,3 +115,46 @@ class TestCATVCarrierAnalyzerSynthetic:
 
         assert carrier_info.carrier_type == CarrierType.Empty
         assert carrier_info.transport_streams == []
+
+
+class TestDetermineRetransmissionSource:
+    """ARIB STD-B10 付録N「ネットワーク識別の割当」に基づく再送信元判定のテスト"""
+
+    def test_nit_not_analyzed_is_unknown(self):
+        # NIT/SDT の解析自体が失敗している場合は判定材料がないため Unknown
+        assert DetermineRetransmissionSource(0x7880, nit_analyzed=False) == 'Unknown'
+        assert DetermineRetransmissionSource(None, nit_analyzed=False) == 'Unknown'
+
+    def test_network_id_none_is_self_broadcast(self):
+        # NIT は取得できたが自 TS のエントリがなかった場合は自主放送とみなす
+        assert DetermineRetransmissionSource(None) == 'SelfBroadcast'
+
+    def test_bs_and_cs(self):
+        assert DetermineRetransmissionSource(0x0004) == 'BS'
+        assert DetermineRetransmissionSource(0x0006) == 'CS'
+        assert DetermineRetransmissionSource(0x0007) == 'CS'
+
+    def test_catv_self_broadcast_range_boundaries(self):
+        # 0x7C1F-0x7F5F は CATV 事業者の地デジ網内自主放送 (JCL SPEC-006/007)
+        # この範囲は地上波の範囲 (0x7880-0x7FE8) に内包されているため、地上波より優先して判定される必要がある
+        assert DetermineRetransmissionSource(0x7C1E) == 'Terrestrial'  # 範囲の直前は地上波再送信
+        assert DetermineRetransmissionSource(0x7C1F) == 'SelfBroadcast'  # 範囲の下限
+        assert DetermineRetransmissionSource(0x7F5F) == 'SelfBroadcast'  # 範囲の上限
+        assert DetermineRetransmissionSource(0x7F60) == 'Terrestrial'  # 範囲の直後は地上波再送信
+
+    def test_terrestrial_range_boundaries(self):
+        # 0x7880-0x7FE8 は地上デジタルテレビジョン放送の再送信
+        assert DetermineRetransmissionSource(0x7880) == 'Terrestrial'
+        assert DetermineRetransmissionSource(0x7FE8) == 'Terrestrial'
+
+    def test_catv_operator_network_ids(self):
+        # 0xFFFC: デジアナ変換 (JCL SPEC-008) / 0xFFFD: JC-HITS トラモジ (JCL SPEC-005)
+        # 0xFFFE: Digital broadcasting ReMUX (JCL SPEC-003/004) / 0xFFFF: 鹿児島ケーブルテレビ (独自規定)
+        assert DetermineRetransmissionSource(0xFFFC) == 'SelfBroadcast'
+        assert DetermineRetransmissionSource(0xFFFD) == 'SelfBroadcast'
+        assert DetermineRetransmissionSource(0xFFFE) == 'SelfBroadcast'
+        assert DetermineRetransmissionSource(0xFFFF) == 'SelfBroadcast'
+
+    def test_unassigned_network_id_falls_back_to_self_broadcast(self):
+        # 付録N のどの割当にも該当しない network_id は自主放送として扱う
+        assert DetermineRetransmissionSource(0x0100) == 'SelfBroadcast'

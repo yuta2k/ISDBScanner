@@ -141,6 +141,64 @@ class TestAnalyzeCASSynthetic:
         assert cas_info.ca_system_ids == [0x0005, 0x0006]
         assert cas_info.required_card == 'C-CAS'
 
+    def test_analyze_cas_all_ccas_system_ids(self):
+        # ARIB STD-B10 付録M 表M-1 の C-CAS 系 3 方式 (0x0003 日立 / 0x0004 Secure Navi / 0x0006 松下 CATV) は
+        # いずれも C-CAS カードが必要と判定されること
+        for ca_system_id in (0x0003, 0x0004, 0x0006):
+            stream = self._build_stream([ca_system_id], scrambled_count=10, free_count=0)
+            cas_info = AnalyzeCAS(stream)
+            assert cas_info.ca_system_ids == [ca_system_id]
+            assert cas_info.required_card == 'C-CAS', f'CA_system_id=0x{ca_system_id:04X} が C-CAS と判定されていない'
+
+    def test_analyze_cas_all_ccas_system_ids_take_priority_over_arib_cas(self):
+        # C-CAS 系のどの方式でも、ARIB 限定受信方式 (0x0005) と併存した場合は C-CAS を優先すること
+        for ca_system_id in (0x0003, 0x0004, 0x0006):
+            stream = self._build_stream([0x0005, ca_system_id], scrambled_count=10, free_count=0)
+            cas_info = AnalyzeCAS(stream)
+            assert cas_info.required_card == 'C-CAS', f'CA_system_id=0x{ca_system_id:04X} が C-CAS を優先していない'
+
+    def test_analyze_cas_arib_cas_only_is_bcas(self):
+        # ARIB 限定受信方式 (0x0005) のみの TS キャリアは B-CAS と判定されること
+        stream = self._build_stream([0x0005], scrambled_count=10, free_count=0)
+        cas_info = AnalyzeCAS(stream)
+        assert cas_info.required_card == 'B-CAS'
+
+    def test_analyze_cas_viewing_control_only_is_unknown(self):
+        # 0x0007 (ケーブルラボ視聴制御方式) は STB 側の視聴制御レイヤと推測されるため C-CAS 扱いにはせず unknown になること
+        stream = self._build_stream([0x0007], scrambled_count=10, free_count=0)
+        cas_info = AnalyzeCAS(stream)
+        assert cas_info.ca_system_ids == [0x0007]
+        assert cas_info.required_card == 'unknown'
+
+    def test_analyze_cas_unscrambled_is_none_regardless_of_ca_system_id(self):
+        # スクランブル率が閾値未満なら、どの CA_system_id が含まれていても 'none' になること
+        for ca_system_id in (0x0003, 0x0004, 0x0005, 0x0006, 0x0007):
+            stream = self._build_stream([ca_system_id], scrambled_count=0, free_count=100)
+            cas_info = AnalyzeCAS(stream)
+            assert cas_info.ca_system_ids == [ca_system_id]
+            assert cas_info.required_card == 'none', f'CA_system_id=0x{ca_system_id:04X} が none と判定されていない'
+
+    def test_analyze_cas_system_names(self):
+        # ca_system_names が ca_system_ids と同じ並び順で埋まること
+        stream = self._build_stream([0x0006, 0x0005], scrambled_count=10, free_count=0)
+        cas_info = AnalyzeCAS(stream)
+        assert cas_info.ca_system_ids == [0x0005, 0x0006]
+        assert cas_info.ca_system_names == ['B-CAS/A-CAS (ARIB 限定受信方式)', 'C-CAS (松下 CATV 限定受信方式)']
+
+    def test_analyze_cas_system_names_unknown_fallback(self):
+        # ARIB STD-B10 付録M 表M-1 に割当のない CA_system_id は 'Unknown (0x00XX)' 形式にフォールバックすること
+        stream = self._build_stream([0x0005, 0x00AB], scrambled_count=10, free_count=0)
+        cas_info = AnalyzeCAS(stream)
+        assert cas_info.ca_system_ids == [0x0005, 0x00AB]
+        assert cas_info.ca_system_names == ['B-CAS/A-CAS (ARIB 限定受信方式)', 'Unknown (0x00AB)']
+        # 未知の CA_system_id しか判定に使えない場合は B-CAS 判定が優先される (未知 ID はカード種別判定には使わない)
+        assert cas_info.required_card == 'B-CAS'
+
+    def test_analyze_cas_system_names_empty_when_no_ca_descriptor(self):
+        stream = self._build_stream([], scrambled_count=0, free_count=50)
+        cas_info = AnalyzeCAS(stream)
+        assert cas_info.ca_system_names == []
+
     def test_analyze_cas_unscrambled_requires_no_card(self):
         stream = self._build_stream([], scrambled_count=0, free_count=50)
         cas_info = AnalyzeCAS(stream)
