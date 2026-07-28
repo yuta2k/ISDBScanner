@@ -13,8 +13,15 @@ from isdb_scanner.catv.constants import (
     RetransmissionSourceChangeInfo,
     ScanDiff,
     ServiceDiffInfo,
+    SignalDegradationWarning,
     TransportStreamDiffInfo,
 )
+
+
+# 前回スキャンからの CNR (C/N比) の低下がこの値 (dB) 以上になった物理チャンネルを、信号品質の劣化として警告する
+# CNR は測定ごとに 1-2dB 程度は普通に揺れるため、明らかな劣化 (減衰器の劣化・分配数増・ケーブル不良など) のみを
+# 拾える程度に余裕を持たせた閾値にしている (CLI オプションにはせず、この定数で固定する)
+SIGNAL_CNR_DROP_WARNING_THRESHOLD_DB = 5.0
 
 
 def CompareScanResults(previous: dict[str, Any], current: dict[str, Any]) -> ScanDiff:
@@ -56,7 +63,43 @@ def CompareScanResults(previous: dict[str, Any], current: dict[str, Any]) -> Sca
         added_channels=added_channels,
         removed_channels=removed_channels,
         changed_channels=changed_channels,
+        signal_warnings=_DetectSignalDegradations(previous_carriers, current_carriers),
     )
+
+
+def _DetectSignalDegradations(
+    previous_carriers: dict[str, CATVCarrierInfo], current_carriers: dict[str, CATVCarrierInfo]
+) -> list[SignalDegradationWarning]:
+    """
+    前回・今回とも存在する物理チャンネルについて signal_stats の CNR を比較し、
+    SIGNAL_CNR_DROP_WARNING_THRESHOLD_DB 以上低下しているチャンネルの警告一覧を返す
+
+    signal_stats 自体が未取得 (--no-collect-signal-stats) だったり、フロントエンドドライバが CNR の dB 値に
+    対応しておらず cnr_db が None のままだったりする場合は、比較のしようがないため単にスキップする
+    """
+
+    warnings: list[SignalDegradationWarning] = []
+    for physical_channel in sorted(set(previous_carriers) & set(current_carriers)):
+        previous_stats = previous_carriers[physical_channel].signal_stats
+        current_stats = current_carriers[physical_channel].signal_stats
+        if previous_stats is None or current_stats is None:
+            continue
+        if previous_stats.cnr_db is None or current_stats.cnr_db is None:
+            continue
+
+        drop_db = previous_stats.cnr_db - current_stats.cnr_db
+        if drop_db >= SIGNAL_CNR_DROP_WARNING_THRESHOLD_DB:
+            warnings.append(
+                SignalDegradationWarning(
+                    physical_channel=physical_channel,
+                    previous_cnr_db=previous_stats.cnr_db,
+                    current_cnr_db=current_stats.cnr_db,
+                    # 浮動小数点演算の誤差がそのまま JSON に出ないよう、低下幅のみ小数第2位で丸める (判定には丸める前の値を使う)
+                    drop_db=round(drop_db, 2),
+                )
+            )
+
+    return warnings
 
 
 def _BuildChannelSummary(carrier: CATVCarrierInfo) -> ChannelSummaryInfo:
@@ -223,7 +266,7 @@ def _BuildTransportStreamDiff(ts_info: CATVTransportStreamInfo) -> TransportStre
 def FormatScanDiff(diff: ScanDiff) -> str:
     """
     ScanDiff を、人間が読めるプレーンテキストのレポートに整形する (rich マークアップは使わない)
-    追加は行頭 "+"、削除は行頭 "-"、変化は行頭 "~" で示す
+    追加は行頭 "+"、削除は行頭 "-"、変化は行頭 "~"、信号品質の劣化警告は行頭 "!" で示す
 
     Args:
         diff (ScanDiff): 差分レポート
@@ -232,12 +275,26 @@ def FormatScanDiff(diff: ScanDiff) -> str:
         str: 整形されたレポート文字列 (末尾に改行を1つ含む)
     """
 
-    if diff.has_changes is False:
-        return 'No changes detected since the previous scan.\n'
-
     lines: list[str] = []
 
+    # 信号品質の劣化警告は、チャンネル構成の差分より前 (レポートの先頭) に出力する
+    if len(diff.signal_warnings) > 0:
+        lines.append('Signal degradation warnings:')
+        for warning in diff.signal_warnings:
+            lines.append(
+                f'  ! {warning.physical_channel}: CNR {warning.previous_cnr_db:.2f} dB -> '
+                f'{warning.current_cnr_db:.2f} dB (-{warning.drop_db:.2f} dB)'
+            )
+
+    if diff.has_changes is False:
+        if len(lines) > 0:
+            lines.append('')
+        lines.append('No changes detected since the previous scan.')
+        return '\n'.join(lines) + '\n'
+
     if len(diff.added_channels) > 0:
+        if len(lines) > 0:
+            lines.append('')
         lines.append('Added Channels:')
         for channel in diff.added_channels:
             lines.append(
@@ -325,3 +382,20 @@ def FormatScanDiff(diff: ScanDiff) -> str:
                 )
 
     return '\n'.join(lines) + '\n'
+
+
+def FormatScanDiffJSON(diff: ScanDiff) -> str:
+    """
+    ScanDiff を、スクリプトなどから機械的に扱える JSON にシリアライズする
+    トップレベルには has_changes (チャンネル構成に変化があったか) と signal_warnings (信号品質の劣化警告) を含むため、
+    `jq -e '.has_changes'` の 1 発で差分の有無を判定できる
+    (CATV.json と同じくインデント幅 4・非 ASCII 文字はエスケープせずそのまま出力する)
+
+    Args:
+        diff (ScanDiff): 差分レポート
+
+    Returns:
+        str: JSON 文字列 (CATV.json に合わせ、末尾に改行は付けない)
+    """
+
+    return diff.model_dump_json(indent=4)

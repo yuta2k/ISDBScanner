@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 from isdb_scanner.catv.constants import (
@@ -6,17 +7,24 @@ from isdb_scanner.catv.constants import (
     CATVCarrierInfo,
     CATVMMTInfo,
     CATVServiceInfo,
+    CATVSignalStats,
     CATVTransportStreamInfo,
     MMTSDTServiceInfo,
     MMTServiceInfo,
 )
-from isdb_scanner.catv.diff import CompareScanResults, FormatScanDiff
+from isdb_scanner.catv.diff import (
+    SIGNAL_CNR_DROP_WARNING_THRESHOLD_DB,
+    CompareScanResults,
+    FormatScanDiff,
+    FormatScanDiffJSON,
+)
 
 
 def BuildCarrierDict(
     physical_channel: str,
     carrier_type: CarrierType = CarrierType.SingleTS,
     transport_streams: list[CATVTransportStreamInfo] | None = None,
+    signal_stats: CATVSignalStats | None = None,
 ) -> dict[str, Any]:
     """テスト用に、CATV.json の1エントリ分 (json.loads() 済みの dict) を CATVCarrierInfo から組み立てる"""
 
@@ -24,6 +32,7 @@ def BuildCarrierDict(
         physical_channel=physical_channel,
         carrier_type=carrier_type,
         transport_streams=transport_streams or [],
+        signal_stats=signal_stats,
     )
     return carrier.model_dump(mode='json')
 
@@ -333,3 +342,202 @@ class TestFormatScanDiff:
         assert 'Changed Channels:' in text
         assert '  ~ CATV_15' in text
         assert '"Service A" -> "Service A Renamed"' in text
+
+
+def BuildCarrierDictWithCNR(physical_channel: str, cnr_db: float | None, with_signal_stats: bool = True) -> dict[str, Any]:
+    """テスト用に、指定した CNR (dB) の signal_stats を持つ CATV.json 1エントリ分の dict を組み立てる"""
+
+    return BuildCarrierDict(
+        physical_channel,
+        signal_stats=CATVSignalStats(cnr_db=cnr_db) if with_signal_stats is True else None,
+    )
+
+
+class TestSignalDegradationWarnings:
+    """前回スキャンからの CNR (C/N比) 低下の検出テスト"""
+
+    def test_cnr_drop_over_threshold_is_warned(self):
+        previous = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 32.0)}
+        current = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 24.5)}
+
+        diff = CompareScanResults(previous, current)
+
+        assert len(diff.signal_warnings) == 1
+        warning = diff.signal_warnings[0]
+        assert warning.physical_channel == 'CATV_15'
+        assert warning.previous_cnr_db == 32.0
+        assert warning.current_cnr_db == 24.5
+        assert warning.drop_db == 7.5
+
+    def test_cnr_drop_exactly_at_threshold_is_warned(self):
+        # ちょうど閾値ぴったりの低下は「警告する」側に含める (>= 判定)
+        previous = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 30.0)}
+        current = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 30.0 - SIGNAL_CNR_DROP_WARNING_THRESHOLD_DB)}
+
+        diff = CompareScanResults(previous, current)
+
+        assert len(diff.signal_warnings) == 1
+        assert diff.signal_warnings[0].drop_db == SIGNAL_CNR_DROP_WARNING_THRESHOLD_DB
+
+    def test_cnr_drop_just_below_threshold_is_not_warned(self):
+        previous = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 30.0)}
+        current = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 25.25)}
+
+        diff = CompareScanResults(previous, current)
+
+        assert diff.signal_warnings == []
+
+    def test_cnr_improvement_is_not_warned(self):
+        previous = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 20.0)}
+        current = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 32.0)}
+
+        diff = CompareScanResults(previous, current)
+
+        assert diff.signal_warnings == []
+
+    def test_null_cnr_is_skipped(self):
+        # cnr_db が片方でも None なら比較できないためスキップする (signal_stats ごと None の場合も同様)
+        previous = {
+            'CATV_15': BuildCarrierDictWithCNR('CATV_15', 32.0),
+            'CATV_16': BuildCarrierDictWithCNR('CATV_16', None),
+            'CATV_17': BuildCarrierDictWithCNR('CATV_17', 32.0),
+        }
+        current = {
+            'CATV_15': BuildCarrierDictWithCNR('CATV_15', 10.0, with_signal_stats=False),
+            'CATV_16': BuildCarrierDictWithCNR('CATV_16', 10.0),
+            'CATV_17': BuildCarrierDictWithCNR('CATV_17', None),
+        }
+
+        diff = CompareScanResults(previous, current)
+
+        assert diff.signal_warnings == []
+
+    def test_added_or_removed_channel_is_not_warned(self):
+        # 前回・今回の双方に存在しない物理チャンネルは比較対象にしない
+        previous = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 32.0)}
+        current = {'CATV_16': BuildCarrierDictWithCNR('CATV_16', 10.0)}
+
+        diff = CompareScanResults(previous, current)
+
+        assert diff.signal_warnings == []
+
+    def test_signal_warning_does_not_count_as_change(self):
+        # CNR は測定ごとに揺れるため、信号品質の劣化警告だけでは has_changes を True にしない
+        previous = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 32.0)}
+        current = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 20.0)}
+
+        diff = CompareScanResults(previous, current)
+
+        assert len(diff.signal_warnings) == 1
+        assert diff.has_changes is False
+
+    def test_warning_section_is_placed_at_the_top_of_the_text_report(self):
+        previous = {
+            'CATV_15': BuildCarrierDictWithCNR('CATV_15', 32.0),
+        }
+        current = {
+            'CATV_15': BuildCarrierDictWithCNR('CATV_15', 20.0),
+            'CATV_16': BuildCarrierDict('CATV_16', carrier_type=CarrierType.TSMF),
+        }
+
+        text = FormatScanDiff(CompareScanResults(previous, current))
+        lines = text.splitlines()
+
+        assert lines[0] == 'Signal degradation warnings:'
+        assert lines[1] == '  ! CATV_15: CNR 32.00 dB -> 20.00 dB (-12.00 dB)'
+        # 既存セクションは信号警告セクションの後ろに、空行を1つ挟んで続く
+        assert lines[2] == ''
+        assert lines[3] == 'Added Channels:'
+
+    def test_warning_is_reported_even_without_changes(self):
+        previous = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 32.0)}
+        current = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 20.0)}
+
+        text = FormatScanDiff(CompareScanResults(previous, current))
+
+        assert text == (
+            'Signal degradation warnings:\n'
+            '  ! CATV_15: CNR 32.00 dB -> 20.00 dB (-12.00 dB)\n'
+            '\n'
+            'No changes detected since the previous scan.\n'
+        )
+
+    def test_text_report_is_unchanged_without_warnings(self):
+        # 信号警告がない場合、既存の CATV.diff.txt のフォーマットは一切変わらない
+        previous: dict[str, Any] = {}
+        current = {'CATV_16': BuildCarrierDict('CATV_16', carrier_type=CarrierType.TSMF)}
+
+        text = FormatScanDiff(CompareScanResults(previous, current))
+
+        assert text.startswith('Added Channels:\n')
+        assert FormatScanDiff(CompareScanResults({}, {})) == 'No changes detected since the previous scan.\n'
+
+
+class TestFormatScanDiffJSON:
+    """機械可読な差分出力 (CATV.diff.json) のテスト"""
+
+    def test_has_changes_is_true_when_changed(self):
+        previous: dict[str, Any] = {}
+        current = {'CATV_16': BuildCarrierDict('CATV_16', carrier_type=CarrierType.TSMF)}
+
+        diff_json = json.loads(FormatScanDiffJSON(CompareScanResults(previous, current)))
+
+        assert diff_json['has_changes'] is True
+        assert [channel['physical_channel'] for channel in diff_json['added_channels']] == ['CATV_16']
+        assert diff_json['removed_channels'] == []
+        assert diff_json['changed_channels'] == []
+        assert diff_json['signal_warnings'] == []
+
+    def test_has_changes_is_false_when_unchanged(self):
+        carrier_dict = BuildCarrierDict('CATV_15')
+
+        diff_json = json.loads(FormatScanDiffJSON(CompareScanResults({'CATV_15': carrier_dict}, {'CATV_15': carrier_dict})))
+
+        assert diff_json['has_changes'] is False
+        assert diff_json['added_channels'] == []
+        assert diff_json['removed_channels'] == []
+        assert diff_json['changed_channels'] == []
+        assert diff_json['signal_warnings'] == []
+
+    def test_signal_warnings_are_included_but_has_changes_stays_false(self):
+        previous = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 32.0)}
+        current = {'CATV_15': BuildCarrierDictWithCNR('CATV_15', 24.5)}
+
+        diff_json = json.loads(FormatScanDiffJSON(CompareScanResults(previous, current)))
+
+        assert diff_json['has_changes'] is False
+        assert diff_json['signal_warnings'] == [
+            {
+                'physical_channel': 'CATV_15',
+                'previous_cnr_db': 32.0,
+                'current_cnr_db': 24.5,
+                'drop_db': 7.5,
+            }
+        ]
+
+    def test_json_formatting_matches_catv_json_style(self):
+        # CATV.json と同じくインデント幅 4・非 ASCII 文字はエスケープせずそのまま出力する
+        previous = {
+            'CATV_15': BuildCarrierDict(
+                'CATV_15',
+                transport_streams=[
+                    BuildTransportStream(0x1001, services=[CATVServiceInfo(service_id=100, service_name='テスト放送')]),
+                ],
+            )
+        }
+        current = {
+            'CATV_15': BuildCarrierDict(
+                'CATV_15',
+                transport_streams=[
+                    BuildTransportStream(0x1001, services=[CATVServiceInfo(service_id=100, service_name='テスト放送 2')]),
+                ],
+            )
+        }
+
+        text = FormatScanDiffJSON(CompareScanResults(previous, current))
+
+        assert '\n    "added_channels": [' in text
+        assert '"service_name": "テスト放送 2"' in text
+        assert '\\u' not in text
+        assert text.endswith('}')  # CATV.json に合わせ末尾に改行は付けない
+        assert json.loads(text)['has_changes'] is True

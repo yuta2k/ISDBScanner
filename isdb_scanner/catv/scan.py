@@ -37,7 +37,7 @@ from isdb_scanner.catv.card_assignment import (
 )
 from isdb_scanner.catv.cards import DetectCASCards, DetectedCard
 from isdb_scanner.catv.constants import CATV_FREQUENCY_TABLE, CATVCarrierInfo, PreferredSource
-from isdb_scanner.catv.diff import CompareScanResults, FormatScanDiff
+from isdb_scanner.catv.diff import CompareScanResults, FormatScanDiff, FormatScanDiffJSON
 from isdb_scanner.catv.edcb import CATVEDCBChSet4TxtFormatter, CATVEDCBChSet5TxtFormatter
 from isdb_scanner.catv.formatter import (
     CATVDvbv5ConfFormatter,
@@ -552,6 +552,15 @@ def main(
         '--no-diff',
         help='Disable the scan diff report against the existing CATV.json in the output directory.',
     ),
+    fail_on_diff: bool = typer.Option(
+        False,
+        '--fail-on-diff',
+        help='Exit with code 2 when the scan completed successfully but the channel lineup changed since the previous '
+        'scan (exit codes: 0 = no changes, 1 = scan failed, 2 = changes detected). Useful for detecting changes from '
+        'scripts: all output files are still written before exiting. '
+        'The first scan (no previous CATV.json) is never treated as a change, and '
+        'signal degradation warnings do not affect the exit code. Cannot be combined with --no-diff.',
+    ),
     satellite: bool = typer.Option(
         False,
         '--satellite/--no-satellite',
@@ -616,6 +625,12 @@ def main(
             align='center',
         )
     )
+
+    # --fail-on-diff は差分レポートの結果に基づいて終了コードを決めるオプションのため、差分レポート自体を無効化する
+    # --no-diff とは指定意図が矛盾する (併用しても終了コードが常に 0 になるだけ) ため、併用不可とする
+    if fail_on_diff is True and no_diff is True:
+        print('[red]--fail-on-diff cannot be combined with --no-diff.[/red]')
+        raise typer.Exit(code=1)
 
     # --from-json (再フォーマットモード): チューナー検出もスキャンも行わず、既存 JSON から出力ファイル群だけを再生成する
     if from_json is True:
@@ -877,6 +892,8 @@ def main(
     # 出力先に既存の CATV.json があれば、上書きする前に読み込んで前回との差分レポートを生成する
     # (--no-diff が指定されている場合や、そもそも前回のスキャン結果が存在しない場合はスキップする)
     catv_json_path = output_dir / 'CATV.json'
+    # --fail-on-diff 用の「前回から変化があったか」フラグ (初回スキャンや差分レポートの生成失敗時は False のまま)
+    diff_has_changes = False
     if no_diff is False and catv_json_path.is_file():
         try:
             previous_scan_result = json.loads(catv_json_path.read_text(encoding='utf-8'))
@@ -891,16 +908,28 @@ def main(
                 current_scan_result = {carrier.physical_channel: carrier.model_dump(mode='json') for carrier in carriers}
                 diff = CompareScanResults(previous_scan_result, current_scan_result)
                 diff_report = FormatScanDiff(diff)
+                diff_report_json = FormatScanDiffJSON(diff)
             except Exception as ex:
                 print(f'[yellow]Failed to generate the scan diff report: {type(ex).__name__}: {ex}[/yellow]')
                 print('[yellow]The previous CATV.json may be corrupted or in an old format. Skipping the diff report.[/yellow]')
             else:
+                diff_has_changes = diff.has_changes
+                # 信号品質が前回から大きく劣化した物理チャンネルは、差分レポート本体とは別に警告として目立たせる
+                # (CNR は測定ごとに揺れるため、--fail-on-diff の終了コードには影響させない)
+                for signal_warning in diff.signal_warnings:
+                    print(
+                        f'[yellow]Signal degradation detected on {signal_warning.physical_channel}: '
+                        f'CNR {signal_warning.previous_cnr_db:.2f} dB -> {signal_warning.current_cnr_db:.2f} dB '
+                        f'(-{signal_warning.drop_db:.2f} dB)[/yellow]'
+                    )
                 print(Rule(characters='-', style=Style(color='#E33157')))
                 print('[bright_blue]Scan Diff Report (compared to the previous CATV.json)[/bright_blue]')
                 # レポート自体は rich マークアップなしのプレーンテキストだが、サービス名などに "[" を含む値が
                 # 混ざっていても rich がマークアップとして誤解釈しないよう escape() を通してから表示する
                 print(escape(diff_report))
                 (output_dir / 'CATV.diff.txt').write_text(diff_report, encoding='utf-8')
+                # 人間向けのテキストと同じタイミングで、スクリプトから jq で判定できる機械可読な JSON も必ず併産する
+                (output_dir / 'CATV.diff.json').write_text(diff_report_json, encoding='utf-8')
 
     CATVJSONFormatter(catv_json_path, carriers).save()
     CATVDvbv5ConfFormatter(output_dir / 'dvbv5_channels_catv.conf', carriers).save()
@@ -967,6 +996,12 @@ def main(
     if satellite_scanned is True:
         print(f'Scanned satellite: BS={len(bs_ts_infos)} TS / CS={len(cs_ts_infos)} TS')
     print(Rule(characters='=', style=Style(color='#E33157')))
+
+    # --fail-on-diff 指定時のみ、スキャンと全出力ファイルの生成が正常に完了した上で、前回から変化があれば終了コード 2 で終了する
+    # (終了コード 1 は「スキャン自体の失敗」に予約されているため使わない。呼び出し元スクリプトは 0/2 と 1 を区別して扱える)
+    if fail_on_diff is True and diff_has_changes is True:
+        print('[yellow]Changes were detected since the previous scan. Exiting with code 2 (--fail-on-diff).[/yellow]')
+        raise typer.Exit(code=2)
 
 
 if __name__ == '__main__':

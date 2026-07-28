@@ -811,3 +811,93 @@ class TestScanCardAssignment:
 
         assert result.exit_code == 0, result.output
         assert not (output_dir / 'CATV.cards.txt').exists()
+
+
+class TestScanDiffOutputAndFailOnDiff:
+    """CATV.diff.json の併産と --fail-on-diff の終了コード (0 = 変化なし / 1 = スキャン失敗 / 2 = 変化あり) のテスト"""
+
+    def _RunScan(self, output_dir: Path, channels: str, extra_args: list[str] | None = None):
+        """偽 dvbv5-zap で指定した物理チャンネルをスキャンする (呼び出し側で fake_dvbv5_zap フィクスチャを要求すること)"""
+
+        return runner.invoke(
+            app,
+            [
+                str(output_dir),
+                '--channels',
+                channels,
+                '--recording-time',
+                '0.5',
+                '--no-collect-signal-stats',
+                '--no-satellite',
+                *(extra_args or []),
+            ],
+        )
+
+    def test_fail_on_diff_with_no_diff_raises(self, tmp_path: Path):
+        # --no-diff は差分レポート自体を生成しないため、--fail-on-diff とは併用できない
+        result = runner.invoke(app, [str(tmp_path / 'out'), '--fail-on-diff', '--no-diff'])
+
+        assert result.exit_code == 1
+        assert '--fail-on-diff cannot be combined with --no-diff' in result.output
+
+    def test_first_scan_is_not_treated_as_a_change(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # 前回のスキャン結果がない初回実行では差分自体が生成されないため、--fail-on-diff でも終了コード 0
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        output_dir = tmp_path / 'out'
+
+        result = self._RunScan(output_dir, 'CATV_15', ['--fail-on-diff'])
+
+        assert result.exit_code == 0, result.output
+        assert not (output_dir / 'CATV.diff.txt').exists()
+        assert not (output_dir / 'CATV.diff.json').exists()
+
+    def test_no_changes_exits_with_code_0(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # 同じチャンネル構成を 2 回スキャンした場合は変化なし → 終了コード 0 / has_changes: false
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        output_dir = tmp_path / 'out'
+
+        assert self._RunScan(output_dir, 'CATV_15,CATV_16').exit_code == 0
+        result = self._RunScan(output_dir, 'CATV_15,CATV_16', ['--fail-on-diff'])
+
+        assert result.exit_code == 0, result.output
+        assert (output_dir / 'CATV.diff.txt').read_text(encoding='utf-8') == 'No changes detected since the previous scan.\n'
+
+        diff_json = json.loads((output_dir / 'CATV.diff.json').read_text(encoding='utf-8'))
+        assert diff_json['has_changes'] is False
+        assert diff_json['added_channels'] == []
+        assert diff_json['removed_channels'] == []
+        assert diff_json['changed_channels'] == []
+        assert diff_json['signal_warnings'] == []
+
+    def test_changes_exit_with_code_2(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # 2 回目で受信できる物理チャンネルが減った場合は変化あり → 終了コード 2 (スキャン失敗の 1 とは区別する)
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        output_dir = tmp_path / 'out'
+
+        assert self._RunScan(output_dir, 'CATV_15,CATV_16').exit_code == 0
+        result = self._RunScan(output_dir, 'CATV_15', ['--fail-on-diff'])
+
+        assert result.exit_code == 2, result.output
+        assert 'Exiting with code 2' in result.output
+
+        # 終了コード 2 でも、スキャン結果の出力ファイル一式は通常どおり生成される
+        assert list(json.loads((output_dir / 'CATV.json').read_text(encoding='utf-8')).keys()) == ['CATV_15']
+        assert (output_dir / 'dvbv5_channels_catv.conf').is_file()
+        assert (output_dir / 'Mirakurun' / 'channels_catv.yml').is_file()
+
+        assert '- CATV_16' in (output_dir / 'CATV.diff.txt').read_text(encoding='utf-8')
+        diff_json = json.loads((output_dir / 'CATV.diff.json').read_text(encoding='utf-8'))
+        assert diff_json['has_changes'] is True
+        assert [channel['physical_channel'] for channel in diff_json['removed_channels']] == ['CATV_16']
+
+    def test_diff_json_is_generated_without_fail_on_diff(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # CATV.diff.json は --fail-on-diff の有無に関わらず、CATV.diff.txt と必ず同時に生成される
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        output_dir = tmp_path / 'out'
+
+        assert self._RunScan(output_dir, 'CATV_15,CATV_16').exit_code == 0
+        result = self._RunScan(output_dir, 'CATV_15')
+
+        assert result.exit_code == 0, result.output
+        assert (output_dir / 'CATV.diff.txt').is_file()
+        assert json.loads((output_dir / 'CATV.diff.json').read_text(encoding='utf-8'))['has_changes'] is True

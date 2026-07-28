@@ -1,7 +1,7 @@
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
 
 
 class PreferredSource(StrEnum):
@@ -516,6 +516,20 @@ class ChannelChangeInfo(BaseModel):
     # fmt: on
 
 
+class SignalDegradationWarning(BaseModel):
+    """
+    スキャン差分レポートにおける、前回スキャンから信号品質 (CNR) が大きく低下した物理チャンネル1件分の警告情報
+    CNR は測定ごとに揺れる値でチャンネル構成の変化とは性質が異なるため、ScanDiff.has_changes (差分の有無) には含めない
+    """
+
+    # fmt: off
+    physical_channel: str = 'Unknown'   # 物理チャンネル (ex: "CATV_15")
+    previous_cnr_db: float = 0.0        # 前回スキャン時の C/N比 (dB)
+    current_cnr_db: float = 0.0         # 今回スキャン時の C/N比 (dB)
+    drop_db: float = 0.0                # 低下幅 (dB。previous_cnr_db - current_cnr_db。常に正の値)
+    # fmt: on
+
+
 class ScanDiff(BaseModel):
     """2回のスキャン結果 (CATV.json をパースした dict) を比較した差分レポート"""
 
@@ -523,10 +537,15 @@ class ScanDiff(BaseModel):
     added_channels: list[ChannelSummaryInfo] = []      # 今回新たに追加された (前回は存在しなかった) 物理チャンネル
     removed_channels: list[ChannelSummaryInfo] = []    # 今回なくなった (前回は存在した) 物理チャンネル
     changed_channels: list[ChannelChangeInfo] = []     # 前回・今回とも存在するが、内容に変化があった物理チャンネル
+    signal_warnings: list[SignalDegradationWarning] = []  # CNR が大きく低下した物理チャンネルの警告 (has_changes には含めない)
     # fmt: on
 
+    @computed_field  # type: ignore[prop-decorator]
     @property
     def has_changes(self) -> bool:
-        """差分が1件でも存在するかどうか"""
+        """
+        チャンネル構成の差分が1件でも存在するかどうか (JSON 出力にも含める)
+        信号品質の劣化警告 (signal_warnings) は測定ごとの揺れを含むため、意図的にこの判定には含めない
+        """
 
         return len(self.added_channels) > 0 or len(self.removed_channels) > 0 or len(self.changed_channels) > 0
