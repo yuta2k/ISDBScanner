@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from isdb_scanner.catv import scan as scan_module
+from isdb_scanner.catv.cards import DetectedCard
 from isdb_scanner.catv.formatter import CATVJSONFormatter, NativeJSONFormatter
 from isdb_scanner.catv.scan import app
 from isdb_scanner.catv.tuner import CATVTuner
@@ -14,11 +16,39 @@ from isdb_scanner.tuner import ISDBTuner, TunerOpeningError
 
 # 実機 (dvbv5-zap) には依存せず、PATH 上に設置した偽の dvbv5-zap でスキャンを検証するためのソースを流用する
 # (このモジュール内のフィクスチャは実機・受信環境に一切依存しない合成データのみで構成されている)
+from tests.test_catv_card_assignment import (
+    FAKE_BCAS_READER_NAME,
+    FAKE_CCAS_READER_NAME,
+    BuildBCASCard,
+    BuildCCASCard,
+)
 from tests.test_catv_formatter import BuildSyntheticBSTsInfos, BuildSyntheticCarriers, BuildSyntheticCSTsInfos
 from tests.test_catv_tuner import FAKE_DVBV5_ZAP_SOURCE
 
 
 runner = CliRunner()
+
+
+def PatchDetectedCards(
+    monkeypatch: pytest.MonkeyPatch,
+    detected_cards: list[DetectedCard],
+    detection_error: str | None = None,
+) -> None:
+    """出力フェーズで呼ばれる DetectCASCards() を、指定した (合成) カード検出結果を返すよう差し替える"""
+
+    monkeypatch.setattr(scan_module, 'DetectCASCards', lambda: (detected_cards, detection_error))
+
+
+@pytest.fixture(autouse=True)
+def no_real_card_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    既定では DetectCASCards() を「カードリーダー未接続」を返すフェイクに差し替える (全テストに自動適用)
+    テストを実行するホストに実際のカードリーダー/CAS カードが接続されていても結果が変わらないようにするためのもので、
+    カード検出込みの挙動を検証するテストでは、テスト内で PatchDetectedCards() を呼んで上書きする
+    """
+
+    PatchDetectedCards(monkeypatch, [], 'カードリーダーが 1 台も接続されていません')
+
 
 # 偽の dvbv5-zap が「ロックできない (受信不可)」「受信データが小さすぎる」「-t の秒数だけ TS を出力し続ける (TLV / TLV 以外)」
 # チャンネルとして予約している物理チャンネル
@@ -661,3 +691,123 @@ class TestScanFromJson:
 
         assert result.exit_code == 1
         assert 'CATV.json was not found' in result.output
+
+
+class TestScanCardAssignment:
+    """--check-cards/--no-check-cards によるカード検出・受信可能性レポート生成のテスト"""
+
+    def _RunScan(self, tmp_path: Path, extra_args: list[str] | None = None) -> tuple[Path, object]:
+        """偽 dvbv5-zap で 1 チャンネルだけスキャンする (呼び出し側で fake_dvbv5_zap フィクスチャを要求すること)"""
+
+        output_dir = tmp_path / 'out'
+        result = runner.invoke(
+            app,
+            [
+                str(output_dir),
+                '--channels',
+                'CATV_15',
+                '--recording-time',
+                '0.5',
+                '--no-collect-signal-stats',
+                '--no-diff',
+                '--no-satellite',
+                *(extra_args or []),
+            ],
+        )
+        return output_dir, result
+
+    def test_report_generated_with_both_cards(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        PatchDetectedCards(monkeypatch, [BuildBCASCard(), BuildCCASCard()])
+
+        output_dir, result = self._RunScan(tmp_path)
+
+        assert result.exit_code == 0, result.output
+        # コンソールに検出したカードの要約が 1 行出ること
+        assert 'Detected cards: B-CAS' in result.output
+        assert 'C-CAS' in result.output
+
+        # 受信可能性レポートが出力されること
+        report = (output_dir / 'CATV.cards.txt').read_text(encoding='utf-8')
+        assert FAKE_BCAS_READER_NAME in report
+        assert FAKE_CCAS_READER_NAME in report
+
+        # B-CAS/C-CAS の両方が検出されたため、デコーダースクリプトも生成されること
+        assert (output_dir / 'Mirakurun' / 'decoder-bcas.sh').is_file()
+        assert (output_dir / 'Mirakurun' / 'decoder-ccas.sh').is_file()
+        assert (output_dir / 'mirakc' / 'decode-filter.sh').is_file()
+        assert stat.S_IMODE((output_dir / 'mirakc' / 'decode-filter.sh').stat().st_mode) == 0o755
+
+        # tuners.yml の CATV エントリの decoder に、生成したラッパースクリプトの絶対パスが入ること
+        tuners_yml = (output_dir / 'Mirakurun' / 'tuners_catv.yml').read_text(encoding='utf-8')
+        assert str(output_dir / 'Mirakurun' / 'decoder-bcas.sh') in tuners_yml
+
+        # CATV.json のスキーマは変更しない (decodable などのカード依存の情報を混ぜない)
+        catv_json = json.loads((output_dir / 'CATV.json').read_text(encoding='utf-8'))
+        assert 'decodable' not in json.dumps(catv_json)
+
+    def test_report_generated_with_bcas_only(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        PatchDetectedCards(monkeypatch, [BuildBCASCard()])
+
+        output_dir, result = self._RunScan(tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert (output_dir / 'CATV.cards.txt').is_file()
+        # 単一カード環境ではデコーダースクリプトを生成しない
+        assert not (output_dir / 'Mirakurun' / 'decoder-bcas.sh').exists()
+        assert not (output_dir / 'mirakc' / 'decode-filter.sh').exists()
+        # 代わりに decoder: arib-b25-stream-test が出力される
+        assert 'arib-b25-stream-test' in (output_dir / 'Mirakurun' / 'tuners_catv.yml').read_text(encoding='utf-8')
+
+    def test_scan_succeeds_when_no_card_detected(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # カードが 1 枚も検出できなくてもスキャン全体は正常終了し、レポートに理由が書かれる
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        PatchDetectedCards(monkeypatch, [], 'PC/SC サービス (pcscd) が起動していません')
+
+        output_dir, result = self._RunScan(tmp_path)
+
+        assert result.exit_code == 0, result.output
+        assert 'No CAS card detected' in result.output
+        assert 'pcscd' in (output_dir / 'CATV.cards.txt').read_text(encoding='utf-8')
+
+    def test_no_check_cards_skips_detection(self, fake_dvbv5_zap: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        # --no-check-cards ではそもそも DetectCASCards() を呼ばないこと
+        monkeypatch.setattr(scan_module, 'DetectCASCards', lambda: pytest.fail('DetectCASCards() must not be called with --no-check-cards'))
+
+        output_dir, result = self._RunScan(tmp_path, ['--no-check-cards'])
+
+        assert result.exit_code == 0, result.output
+        assert not (output_dir / 'CATV.cards.txt').exists()
+        assert not (output_dir / 'mirakc' / 'decode-filter.sh').exists()
+        # カード在庫を渡していないため decoder キーも出力されない (従来どおりの出力)
+        assert 'decoder' not in (output_dir / 'Mirakurun' / 'tuners_catv.yml').read_text(encoding='utf-8')
+
+    def test_from_json_also_generates_report(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        # --from-json 再フォーマットモードでも受信可能性レポート・デコーダースクリプトが生成されること
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        PatchDetectedCards(monkeypatch, [BuildBCASCard(), BuildCCASCard()])
+        output_dir = tmp_path / 'out'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        CATVJSONFormatter(output_dir / 'CATV.json', BuildSyntheticCarriers()).save()
+
+        result = runner.invoke(app, [str(output_dir), '--from-json'])
+
+        assert result.exit_code == 0, result.output
+        assert 'Detected cards: B-CAS' in result.output
+        assert (output_dir / 'CATV.cards.txt').is_file()
+        assert (output_dir / 'Mirakurun' / 'decoder-bcas.sh').is_file()
+        assert (output_dir / 'mirakc' / 'decode-filter.sh').is_file()
+
+    def test_from_json_with_no_check_cards(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        PatchAvailableTuners(monkeypatch, [CATVTuner(0)])
+        monkeypatch.setattr(scan_module, 'DetectCASCards', lambda: pytest.fail('DetectCASCards() must not be called with --no-check-cards'))
+        output_dir = tmp_path / 'out'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        CATVJSONFormatter(output_dir / 'CATV.json', BuildSyntheticCarriers()).save()
+
+        result = runner.invoke(app, [str(output_dir), '--from-json', '--no-check-cards'])
+
+        assert result.exit_code == 0, result.output
+        assert not (output_dir / 'CATV.cards.txt').exists()

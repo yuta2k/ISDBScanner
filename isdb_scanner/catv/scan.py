@@ -30,6 +30,12 @@ from rich.rule import Rule
 from rich.style import Style
 
 from isdb_scanner.catv.analyzer import CATVCarrierAnalyzer
+from isdb_scanner.catv.card_assignment import (
+    CATVCardAssignmentReportFormatter,
+    FormatDetectedCardsSummary,
+    WriteDecoderScripts,
+)
+from isdb_scanner.catv.cards import DetectCASCards, DetectedCard
 from isdb_scanner.catv.constants import CATV_FREQUENCY_TABLE, CATVCarrierInfo, PreferredSource
 from isdb_scanner.catv.diff import CompareScanResults, FormatScanDiff
 from isdb_scanner.catv.edcb import CATVEDCBChSet4TxtFormatter, CATVEDCBChSet5TxtFormatter
@@ -265,6 +271,35 @@ def _EmitNativeScanDiff(
     (output_dir / f'{band_label}.diff.txt').write_text(diff_report, encoding='utf-8')
 
 
+def _DetectCASCardsForOutput(check_cards: bool) -> tuple[list[DetectedCard] | None, str | None]:
+    """
+    出力フェーズで 1 回だけ CAS カードの在庫を取得し、コンソールに要約を表示する
+
+    カードが 1 枚も検出できなくても (pcscd 不在・リーダー未接続など) スキャン全体を止めてはならないため、
+    DetectCASCards() は例外を投げず理由を返す設計になっている。ここでもその理由を表示するにとどめる
+
+    Args:
+        check_cards (bool): カード検出を行うかどうか (--check-cards/--no-check-cards)
+
+    Returns:
+        tuple[list[DetectedCard] | None, str | None]: (検出結果, 検出に失敗した理由)
+            カード検出を行わなかった場合は (None, None) を返す (この場合、出力は従来と完全に同一になる)
+    """
+
+    if check_cards is False:
+        return None, None
+
+    detected_cards, detection_error = DetectCASCards()
+    summary = FormatDetectedCardsSummary(detected_cards, detection_error)
+    if summary is not None:
+        # 要約にはリーダー名 (メーカー名がそのまま入り "[" を含みうる) が混ざるため escape() を通してから表示する
+        if len(detected_cards) > 0 and detection_error is None:
+            print(f'[green]{escape(summary)}[/green]')
+        else:
+            print(f'[yellow]{escape(summary)}[/yellow]')
+    return detected_cards, detection_error
+
+
 def _WriteRecorderConfigs(
     output_dir: Path,
     carriers: list[CATVCarrierInfo],
@@ -273,10 +308,15 @@ def _WriteRecorderConfigs(
     isdbs_tuners: list[ISDBTuner],
     formatter_kwargs: dict,
     warn_when_no_catv_tuner: bool = False,
+    detected_cards: list[DetectedCard] | None = None,
+    detection_error: str | None = None,
 ) -> None:
     """
     レコーダー (Mirakurun/mirakc) 向けのチャンネル設定 (channels_catv.yml) / チューナー設定 (tuners_catv.yml) と、
     EDCB (EDCB-Wine) 向けの ChSet4/ChSet5 テキストを出力する。通常スキャン時と --from-json 再フォーマット時で共用する
+
+    detected_cards が渡された場合は、受信可能性レポート (CATV.cards.txt) と、B-CAS/C-CAS の両方が検出された
+    ときのみデコーダースクリプト (Mirakurun/decoder-*.sh, mirakc/decode-filter.sh) も併せて出力する
 
     Args:
         output_dir (Path): 出力先ディレクトリ (絶対パス)
@@ -286,6 +326,8 @@ def _WriteRecorderConfigs(
         isdbs_tuners (list[ISDBTuner]): tuners_catv.yml に列挙する ISDB-S チューナー (未検出なら空リスト)
         formatter_kwargs (dict): channels/EDCB フォーマッターに渡す共通キーワード引数 (_BuildFormatterKwargs() の戻り値)
         warn_when_no_catv_tuner (bool): CATV チューナーが 0 台のとき tuners_catv.yml をスキップした旨を黄警告するか
+        detected_cards (list[DetectedCard] | None): 検出された CAS カードの一覧 (None = カード検出を行っていない)
+        detection_error (str | None): カード検出に失敗した理由 (成功時・未実行時は None)
     """
 
     # Mirakurun/mirakc 向けチャンネル設定 (CATV 分 + ネイティブ地上波/BS/CS 分)
@@ -304,6 +346,14 @@ def _WriteRecorderConfigs(
     CATVEDCBChSet4TxtFormatter(edcb_dir / 'BonDriver_mirakc(BonDriver_mirakc).ChSet4.txt', carriers, **formatter_kwargs).save()
     CATVEDCBChSet5TxtFormatter(edcb_dir / 'ChSet5.txt', carriers, **formatter_kwargs).save()
 
+    # CAS カードの在庫を取得している場合は、受信可能性レポート (CATV.cards.txt) とデコーダースクリプトを出力する
+    # (CATV チューナーが 0 台で tuners_catv.yml を出力しない場合でもレポート自体は有用なため、早期 return より前に行う)
+    if detected_cards is not None:
+        CATVCardAssignmentReportFormatter(output_dir / 'CATV.cards.txt', carriers, detected_cards, detection_error).save()
+        # B-CAS/C-CAS の両方が検出されたときのみ、カードを使い分けるためのデコーダースクリプトが生成される
+        for script_path in WriteDecoderScripts(output_dir, carriers, detected_cards):
+            print(f'Generated decoder script: [green]{escape(str(script_path))}[/green]')
+
     # チューナー設定 (tuners_catv.yml): channels 側に実際に出力される CATV エントリの type 集合を CATV チューナーの types に列挙する
     if len(catv_tuners) == 0:
         if warn_when_no_catv_tuner is True:
@@ -321,10 +371,22 @@ def _WriteRecorderConfigs(
     )
     dvbv5_conf_path = output_dir / 'dvbv5_channels_catv.conf'
     CATVMirakurunTunersYmlFormatter(
-        mirakurun_dir / 'tuners_catv.yml', catv_tuners, isdbt_tuners, isdbs_tuners, dvbv5_conf_path, catv_channel_types
+        mirakurun_dir / 'tuners_catv.yml',
+        catv_tuners,
+        isdbt_tuners,
+        isdbs_tuners,
+        dvbv5_conf_path,
+        catv_channel_types,
+        detected_cards,
     ).save()
     CATVMirakcTunersYmlFormatter(
-        mirakc_dir / 'tuners_catv.yml', catv_tuners, isdbt_tuners, isdbs_tuners, dvbv5_conf_path, catv_channel_types
+        mirakc_dir / 'tuners_catv.yml',
+        catv_tuners,
+        isdbt_tuners,
+        isdbs_tuners,
+        dvbv5_conf_path,
+        catv_channel_types,
+        detected_cards,
     ).save()
 
 
@@ -337,6 +399,7 @@ def _ReformatFromJson(
     normalize_names: bool,
     lnb: LNBVoltage,
     output_recisdb_log: bool,
+    check_cards: bool = False,
 ) -> None:
     """
     --from-json 再フォーマットモード: チューナー検出もスキャンも行わず、出力先に既存の JSON (CATV.json 必須 +
@@ -348,6 +411,7 @@ def _ReformatFromJson(
         exclude_pay_tv / bcas_only / cas_as_sky / prefer / normalize_names: 出力系オプション (channels/EDCB へ受け渡す)
         lnb (LNBVoltage): tuners 生成用のライブチューナー検出時の LNB 給電電圧
         output_recisdb_log (bool): tuners 生成用のライブチューナー検出時に recisdb ログを出力するか
+        check_cards (bool): 接続されている CAS カードを検出し、受信可能性レポート・デコーダースクリプトを生成するか
     """
 
     output_dir = output_dir.resolve()
@@ -401,11 +465,22 @@ def _ReformatFromJson(
         isdbt_tuners = ISDBTuner.getAvailableISDBTTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
         isdbs_tuners = ISDBTuner.getAvailableISDBSTuners(lnb=lnb, output_recisdb_log=output_recisdb_log)
 
+    # 接続されている CAS カードの在庫を 1 回だけ取得する (--from-json でも通常スキャン時と同様に動作する)
+    detected_cards, detection_error = _DetectCASCardsForOutput(check_cards)
+
     formatter_kwargs = _BuildFormatterKwargs(
         tr_ts_infos, bs_ts_infos, cs_ts_infos, exclude_pay_tv, bcas_only, cas_as_sky, prefer, normalize_names
     )
     _WriteRecorderConfigs(
-        output_dir, carriers, catv_tuners, isdbt_tuners, isdbs_tuners, formatter_kwargs, warn_when_no_catv_tuner=True
+        output_dir,
+        carriers,
+        catv_tuners,
+        isdbt_tuners,
+        isdbs_tuners,
+        formatter_kwargs,
+        warn_when_no_catv_tuner=True,
+        detected_cards=detected_cards,
+        detection_error=detection_error,
     )
 
     print(Rule(characters='=', style=Style(color='#E33157')))
@@ -454,6 +529,18 @@ def main(
         'TLV carrier. No extension happens when this is less than or equal to --recording-time.',
     ),
     list_tuners: bool = typer.Option(False, '--list-tuners', help='List available CATV (DVB-C ANNEX_A) tuners and exit.'),
+    list_card_readers: bool = typer.Option(
+        False,
+        '--list-card-readers',
+        help='List connected PC/SC card readers with the CAS card type (B-CAS/C-CAS) detected in each of them, and exit.',
+    ),
+    check_cards: bool = typer.Option(
+        True,
+        '--check-cards/--no-check-cards',
+        help='Detect the CAS cards (B-CAS/C-CAS) inserted in the connected PC/SC card readers after the scan, and '
+        'output a decodability report (CATV.cards.txt). When both a B-CAS card and a C-CAS card are found, decoder '
+        'wrapper scripts for Mirakurun/mirakc are generated as well (default: enabled).',
+    ),
     output_dvbv5_zap_log: bool = typer.Option(False, help='Output dvbv5-zap log to stderr.'),
     collect_signal_stats: bool = typer.Option(
         True,
@@ -532,7 +619,39 @@ def main(
 
     # --from-json (再フォーマットモード): チューナー検出もスキャンも行わず、既存 JSON から出力ファイル群だけを再生成する
     if from_json is True:
-        _ReformatFromJson(output_dir, exclude_pay_tv, bcas_only, cas_as_sky, prefer, normalize_names, lnb, output_recisdb_log)
+        _ReformatFromJson(
+            output_dir,
+            exclude_pay_tv,
+            bcas_only,
+            cas_as_sky,
+            prefer,
+            normalize_names,
+            lnb,
+            output_recisdb_log,
+            check_cards,
+        )
+        return
+
+    # --list-card-readers が指定されている場合、接続されている PC/SC カードリーダーとカード種別を表示して終了
+    # (カードの識別のみを行う補助機能で、スキャンやチューナー検出は一切行わない)
+    if list_card_readers is True:
+        detected_cards, detection_error = DetectCASCards()
+        if detection_error is not None:
+            print(f'[yellow]{escape(detection_error)}[/yellow]')
+        else:
+            print(f'Detected {len(detected_cards)} card reader(s).')
+            for index, detected_card in enumerate(detected_cards):
+                print(f'Reader {index}: [green]{escape(detected_card.reader_name)}[/green]')
+                if detected_card.error is not None:
+                    print(f'  [yellow]{escape(detected_card.error)}[/yellow]')
+                else:
+                    assert detected_card.ca_system_id is not None
+                    print(f'  Card Type    : [bright_blue]{detected_card.card_type.value}[/bright_blue]')
+                    print(f'  CA System ID : 0x{detected_card.ca_system_id:04X} ({escape(detected_card.ca_system_name)})')
+                    print(f'  Card ID      : {detected_card.card_id}')
+                if detected_card.atr is not None:
+                    print(f'  ATR          : {detected_card.atr}')
+        print(Rule(characters='=', style=Style(color='#E33157')))
         return
 
     # 利用可能な CATV (DVB-C ANNEX_A) 対応チューナーを検出
@@ -801,11 +920,22 @@ def main(
 
     # レコーダー (Mirakurun/mirakc) 向けのチャンネル設定・チューナー設定・EDCB 出力もあわせて出力する
     # (ネイティブ地上波/BS/CS のスキャンを実行した場合は、CATV 分に加えてそのチャンネルエントリも統合して出力される)
+    # 接続されている CAS カードの在庫を 1 回だけ取得する
+    # (カードが 1 枚も検出できなくてもスキャン全体は正常終了させ、理由をレポートに書くだけに留める)
+    detected_cards, detection_error = _DetectCASCardsForOutput(check_cards)
+
     formatter_kwargs = _BuildFormatterKwargs(
         tr_ts_infos, bs_ts_infos, cs_ts_infos, exclude_pay_tv, bcas_only, cas_as_sky, prefer, normalize_names
     )
     _WriteRecorderConfigs(
-        output_dir, carriers, scan_tuners, terrestrial_tuners, satellite_tuners, formatter_kwargs
+        output_dir,
+        carriers,
+        scan_tuners,
+        terrestrial_tuners,
+        satellite_tuners,
+        formatter_kwargs,
+        detected_cards=detected_cards,
+        detection_error=detection_error,
     )
 
     # ネイティブスキャンと CATV 再送信の同一放送種別 (地上波/BS/CS) チャンネルを併用すると、レコーダー設定上どちらも

@@ -28,6 +28,9 @@ from isdb_scanner.catv.formatter import (
 )
 from isdb_scanner.constants import ServiceInfo, TransportStreamInfo
 
+# tuners 設定へのカード在庫統合のテストで使う、合成のカード検出結果ビルダー
+from tests.test_catv_card_assignment import BuildBCASCard, BuildCCASCard
+
 
 def LoadYaml(text: str):
     """テスト用に YAML 文字列 (先頭のコメント行を除く) をパースして Python オブジェクトに変換する"""
@@ -978,5 +981,109 @@ class TestCATVTunersYmlFormatter:
         ).save()
         assert save_path.is_file()
         assert save_path.read_text(encoding='utf-8') == formatted_str
+
+
+class TestCATVTunersYmlFormatterCardAssignment:
+    """tuners 設定へのカード在庫 (DetectedCard) 統合のテスト"""
+
+    def _MirakurunFormat(self, detected_cards, save_file_path: Path = Path('/output/Mirakurun/tuners_catv.yml')) -> str:
+        return CATVMirakurunTunersYmlFormatter(
+            save_file_path,
+            [_FakeCATVTuner('DVB-C Tuner', 0)],
+            [],
+            [],
+            Path('/tmp/dvbv5.conf'),
+            ['GR', 'SKY'],
+            detected_cards,
+        ).format()
+
+    def _MirakcFormat(self, detected_cards, save_file_path: Path = Path('/output/mirakc/tuners_catv.yml')) -> str:
+        return CATVMirakcTunersYmlFormatter(
+            save_file_path,
+            [_FakeCATVTuner('DVB-C Tuner', 0)],
+            [],
+            [],
+            Path('/tmp/dvbv5.conf'),
+            ['GR', 'SKY'],
+            detected_cards,
+        ).format()
+
+    def test_none_keeps_backward_compatible_output(self):
+        # カード在庫を渡さなかった場合 (None) は、引数を省略したときと完全に同一の出力になること (後方互換)
+        mirakurun_omitted = CATVMirakurunTunersYmlFormatter(
+            Path('/output/Mirakurun/tuners_catv.yml'),
+            [_FakeCATVTuner('DVB-C Tuner', 0)],
+            [],
+            [],
+            Path('/tmp/dvbv5.conf'),
+            ['GR', 'SKY'],
+        ).format()
+        assert self._MirakurunFormat(None) == mirakurun_omitted
+        # decoder キーもカード関連のコメントも一切出力されないこと
+        assert 'decoder' not in mirakurun_omitted
+        assert 'CAS カード' not in mirakurun_omitted
+        assert LoadYaml(mirakurun_omitted)[0].get('decoder') is None
+
+        mirakc_omitted = CATVMirakcTunersYmlFormatter(
+            Path('/output/mirakc/tuners_catv.yml'),
+            [_FakeCATVTuner('DVB-C Tuner', 0)],
+            [],
+            [],
+            Path('/tmp/dvbv5.conf'),
+            ['GR', 'SKY'],
+        ).format()
+        assert self._MirakcFormat(None) == mirakc_omitted
+        assert 'decode-filter' not in mirakc_omitted
+        assert 'CAS カード' not in mirakc_omitted
+
+    def test_bcas_only_uses_arib_b25_stream_test(self):
+        formatted_str = self._MirakurunFormat([BuildBCASCard()])
+        catv_tuner = LoadYaml(formatted_str)[0]
+        # 単一カード環境ではリーダーを選ぶ必要がないため、upstream と同じ arib-b25-stream-test を指定する
+        assert catv_tuner['decoder'] == 'arib-b25-stream-test'
+        assert 'B-CAS カードのみを検出した' in formatted_str
+
+    def test_ccas_only_uses_arib_b25_stream_test(self):
+        formatted_str = self._MirakurunFormat([BuildCCASCard()])
+        assert LoadYaml(formatted_str)[0]['decoder'] == 'arib-b25-stream-test'
+        assert 'C-CAS カードのみを検出した' in formatted_str
+
+    def test_both_cards_use_generated_wrapper_script(self):
+        formatted_str = self._MirakurunFormat([BuildBCASCard(), BuildCCASCard()])
+        catv_tuner = LoadYaml(formatted_str)[0]
+        # 混在環境では、tuners.yml と同じディレクトリに生成されるラッパースクリプトを decoder に指定する
+        assert catv_tuner['decoder'] == '/output/Mirakurun/decoder-bcas.sh'
+        # SKY 専用チューナー + decoder-ccas.sh の構成例がヘッダーコメントで示されること
+        assert '--cas-as-sky' in formatted_str
+        assert '/output/Mirakurun/decoder-ccas.sh' in formatted_str
+        # アダプタを共有してはならないこと・その理由 (Mirakurun に排他制御が無いこと) が明示されること
+        assert 'Tuner.ts' in formatted_str
+        assert '二重起動' in formatted_str
+        assert '別のアダプタ' in formatted_str
+
+    def test_no_card_detected_omits_decoder(self):
+        # カードを 1 枚も検出できなかった場合は decoder を出力せず、確認方法だけを案内する
+        formatted_str = self._MirakurunFormat([])
+        assert LoadYaml(formatted_str)[0].get('decoder') is None
+        assert '--list-card-readers' in formatted_str
+
+    def test_mirakc_header_includes_decode_filter_example(self):
+        formatted_str = self._MirakcFormat([BuildBCASCard(), BuildCCASCard()])
+        assert 'filters:' in formatted_str
+        assert 'decode-filter:' in formatted_str
+        assert '/output/mirakc/decode-filter.sh' in formatted_str
+        # mustache 変数の実名が書かれていること
+        assert '{{{channel_name}}}' in formatted_str
+        assert '{{{channel_type}}}' in formatted_str
+        assert '{{{channel}}}' in formatted_str
+
+    def test_mirakc_single_card_says_default_is_enough(self):
+        formatted_str = self._MirakcFormat([BuildBCASCard()])
+        assert '既定の filters.decode-filter.command の設定で足りる' in formatted_str
+        assert '/output/mirakc/decode-filter.sh' not in formatted_str
+
+    def test_mirakc_no_card_detected(self):
+        formatted_str = self._MirakcFormat([])
+        assert '--list-card-readers' in formatted_str
 
 

@@ -9,6 +9,13 @@ from typing import NotRequired
 from ruamel.yaml import YAML
 from typing_extensions import TypedDict
 
+from isdb_scanner.catv.card_assignment import (
+    MIRAKC_DECODE_FILTER_SCRIPT_NAME,
+    MIRAKURUN_BCAS_DECODER_SCRIPT_NAME,
+    MIRAKURUN_CCAS_DECODER_SCRIPT_NAME,
+    FindReaderNameForCardType,
+)
+from isdb_scanner.catv.cards import CardType, DetectedCard
 from isdb_scanner.catv.constants import (
     CATV_FREQUENCY_TABLE,
     BuildDvbv5ConfEntryLines,
@@ -830,6 +837,8 @@ CATVMirakurunTuner = TypedDict(
         'name': str,
         'types': list[str],
         'command': str,
+        # CAS カードを検出できたときのみ出力する (未検出時・カード在庫未指定時は従来どおりキー自体を出力しない)
+        'decoder': NotRequired[str],
         'isDisabled': bool,
     },
 )
@@ -878,6 +887,148 @@ def _BuildRecisdbTunerCommandMirakc(tuner: ISDBTuner) -> str:
     return f'recisdb tune --device {tuner.device_path} --channel ' + '{{{channel}}} -'
 
 
+def _BuildMirakurunCardHeaderLines(detected_cards: list[DetectedCard], script_dir: Path) -> list[str]:
+    """
+    Mirakurun 用 tuners.yml のヘッダーコメントに追記する、CAS カード関連の説明行を組み立てる
+    (カード在庫が渡された場合のみ呼ばれる。カード在庫が未指定 (None) のときは呼ばれず、従来どおりの出力になる)
+
+    Args:
+        detected_cards (list[DetectedCard]): 検出されたカードの一覧 (1 枚も検出できなかった場合は空リスト)
+        script_dir (Path): デコーダーラッパースクリプトを生成したディレクトリ (tuners.yml と同じディレクトリ)
+
+    Returns:
+        list[str]: ヘッダーコメントに追記する行の一覧
+    """
+
+    bcas_reader_name = FindReaderNameForCardType(detected_cards, CardType.BCAS)
+    ccas_reader_name = FindReaderNameForCardType(detected_cards, CardType.CCAS)
+
+    if bcas_reader_name is None and ccas_reader_name is None:
+        return [
+            '#',
+            '# CAS カードを 1 枚も検出できなかったため、CATV チューナーに decoder は指定していない。',
+            '# 検出状況は CATV.cards.txt、または `isdb-catv-scanner --list-card-readers` で確認できる。',
+        ]
+
+    if bcas_reader_name is None or ccas_reader_name is None:
+        # 片方のカードしか無い環境ではリーダーを選ぶ必要がないため、リーダー選択のできない arib-b25-stream-test で足りる
+        detected_label = 'B-CAS' if bcas_reader_name is not None else 'C-CAS'
+        return [
+            '#',
+            f'# {detected_label} カードのみを検出したため、CATV チューナーの decoder には arib-b25-stream-test を指定している。',
+            '# arib-b25-stream-test は Linux ではカードリーダーを選択できない (リーダー選択用の ini 設定は Windows 専用で、',
+            '# CLI オプションも存在しない) が、CAS カードが 1 種類しか挿さっていないため選択の必要がない。',
+            '# B-CAS カードと C-CAS カードを併用する場合は、--card でリーダー名を指定できる recisdb が必要になる',
+            '# (両方のカードを挿した状態で再スキャンすると、ラッパースクリプトが自動生成される)。',
+        ]
+
+    return [
+        '#',
+        '# B-CAS カードと C-CAS カードの両方を検出したため、CATV チューナーの decoder には自動生成した',
+        f'# {MIRAKURUN_BCAS_DECODER_SCRIPT_NAME} (B-CAS 用リーダーを --card で固定した recisdb decode のラッパー) を指定している。',
+        '#',
+        '# Mirakurun の decoder はチューナー単位でしか指定できず、かつ child_process.spawn(command) で起動されるため',
+        '# 引数を一切渡せない。このためチャンネルごとにカードを使い分けるには、次の 3 点セットが必要になる:',
+        '#   1. ISDBScanner を --cas-as-sky 付きで実行し、C-CAS が必要なチャンネルを type: SKY として分離する',
+        '#   2. types に SKY のみを持つ SKY 専用のチューナーエントリを別途立てる',
+        f'#   3. その SKY 専用エントリの decoder に {MIRAKURUN_CCAS_DECODER_SCRIPT_NAME} を指定する',
+        '#',
+        '# SKY 専用エントリの記述例 (自動生成はしていないため、必要に応じて手動で追記すること):',
+        '#',
+        '#   - name: CATV Tuner (SKY / C-CAS)',
+        '#     types:',
+        '#       - SKY',
+        '#     command: dvbv5-zap -c <生成した dvbv5_channels_catv.conf> -a 1 -P -t 0 -o - <channel>',
+        f'#     decoder: {script_dir / MIRAKURUN_CCAS_DECODER_SCRIPT_NAME}',
+        '#     isDisabled: false',
+        '#',
+        '# ※ SKY 専用エントリを自動生成していないのは、アダプタを安全に割り当てられないため。',
+        '#   Mirakurun は tuners.yml のエントリ間で物理アダプタの重複を一切チェックしない (Tuner.ts の _load() は',
+        '#   設定エントリをそのまま push するだけ) ため、B-CAS 用エントリと SKY 用エントリで同じアダプタ番号 (-a N) を',
+        '#   共有すると、同一アダプタに対して dvbv5-zap が二重起動しうる。',
+        '#   SKY 専用エントリには必ず別のアダプタ (別の物理チューナー) を割り当てること。',
+        '# ※ 一方でカード自体は共有できる: pcscd の SHARED 接続により 1 枚のカードを複数プロセスから同時に使えるため',
+        '#   (libaribb25 は SCardBeginTransaction を使わず ECM 処理も 1 APDU で完結し、pcscd のリーダー単位の mutex で',
+        '#   直列化される)、同じカードを複数のチューナーエントリからデコードに使っても問題ない。',
+        '#   排他的に扱う必要があるのはカードではなくアダプタ (チューナー) の方。',
+    ]
+
+
+def _GetMirakurunDecoderCommand(detected_cards: list[DetectedCard], script_dir: Path) -> str | None:
+    """
+    CATV チューナーエントリの `decoder:` に出力する値を決める (出力しない場合は None)
+
+    - B-CAS/C-CAS のどちらか一方のみ検出: リーダー選択が不要なため arib-b25-stream-test
+      (既存 isdb_scanner/formatter.py の MirakurunTunersYmlFormatter が出力しているものと同じ)
+    - 両方検出: リーダー名を --card で固定した recisdb decode のラッパースクリプト (B-CAS 用)
+    - 1 枚も検出できなかった場合: None (従来どおり decoder キー自体を出力しない)
+    """
+
+    bcas_reader_name = FindReaderNameForCardType(detected_cards, CardType.BCAS)
+    ccas_reader_name = FindReaderNameForCardType(detected_cards, CardType.CCAS)
+    if bcas_reader_name is None and ccas_reader_name is None:
+        return None
+    if bcas_reader_name is None or ccas_reader_name is None:
+        return 'arib-b25-stream-test'
+    return str(script_dir / MIRAKURUN_BCAS_DECODER_SCRIPT_NAME)
+
+
+def _BuildMirakcCardHeaderLines(detected_cards: list[DetectedCard], script_dir: Path) -> list[str]:
+    """
+    mirakc 用 tuners 設定断片のヘッダーコメントに追記する、CAS カード関連の説明行を組み立てる
+    (カード在庫が渡された場合のみ呼ばれる。カード在庫が未指定 (None) のときは呼ばれず、従来どおりの出力になる)
+
+    Args:
+        detected_cards (list[DetectedCard]): 検出されたカードの一覧 (1 枚も検出できなかった場合は空リスト)
+        script_dir (Path): decode-filter スクリプトを生成したディレクトリ (tuners 設定断片と同じディレクトリ)
+
+    Returns:
+        list[str]: ヘッダーコメントに追記する行の一覧
+    """
+
+    bcas_reader_name = FindReaderNameForCardType(detected_cards, CardType.BCAS)
+    ccas_reader_name = FindReaderNameForCardType(detected_cards, CardType.CCAS)
+
+    if bcas_reader_name is None and ccas_reader_name is None:
+        return [
+            '#',
+            '# CAS カードを 1 枚も検出できなかったため、decode-filter の設定例は出力していない。',
+            '# 検出状況は CATV.cards.txt、または `isdb-catv-scanner --list-card-readers` で確認できる。',
+        ]
+
+    if bcas_reader_name is None or ccas_reader_name is None:
+        detected_label = 'B-CAS' if bcas_reader_name is not None else 'C-CAS'
+        return [
+            '#',
+            f'# {detected_label} カードのみを検出した。CAS カードが 1 種類しか挿さっていない環境では使うリーダーを',
+            '# 選ぶ必要がないため、mirakc 既定の filters.decode-filter.command の設定で足りる。',
+            '# B-CAS カードと C-CAS カードを併用する場合は、チャンネルごとにリーダーを切り替える decode-filter が',
+            '# 必要になる (両方のカードを挿した状態で再スキャンすると、そのスクリプトが自動生成される)。',
+        ]
+
+    decode_filter_path = script_dir / MIRAKC_DECODE_FILTER_SCRIPT_NAME
+    return [
+        '#',
+        '# B-CAS カードと C-CAS カードの両方を検出したため、チャンネルごとに使うカードリーダーを切り替える',
+        f'# decode-filter スクリプト ({MIRAKC_DECODE_FILTER_SCRIPT_NAME}) を自動生成している。',
+        '# mirakc の filters.decode-filter.command はチャンネルごとに Mustache でレンダリングされ、',
+        '# テンプレート変数 channel_name / channel_type / channel を利用できるため、フィルタ側で分岐できる。',
+        '# config.yml への組み込み例:',
+        '#',
+        '#   filters:',
+        '#     decode-filter:',
+        f"#       command: {decode_filter_path} '{{{{{{channel_name}}}}}}' '{{{{{{channel_type}}}}}}' '{{{{{{channel}}}}}}'",
+        '#',
+        '# ※ mirakc はレンダリング結果をシェルに渡さず shell_words で単語分割して直接 exec するため',
+        '#   (mirakc-core/src/command_util.rs の CommandBuilder::new())、値にスペースが含まれても壊れないよう',
+        '#   上記のように各変数をシングルクォートで囲むこと (クォート自体は shell_words が解釈する)。',
+        '# ※ スクリプト内の分岐は --cas-as-sky の指定有無に依存しないよう、channel_type ではなく',
+        '#   「C-CAS が必要な物理チャンネル名の明示リスト」で行っている。',
+        '# ※ pcscd の SHARED 接続により 1 枚のカードを複数プロセスから同時に使えるため、複数チューナーで同時に',
+        '#   デコードしてもカードの取り合いにはならない。',
+    ]
+
+
 class CATVMirakurunTunersYmlFormatter:
     """
     検出したチューナー (CATV / ISDB-T / ISDB-S) から Mirakurun 用の tuners.yml を生成するフォーマッター
@@ -886,7 +1037,8 @@ class CATVMirakurunTunersYmlFormatter:
     channels 側 (channels_catv.yml) に実際に出力された CATV エントリの type 集合 (catv_channel_types) をそのまま列挙する
     (GetEmittedCATVChannelTypes() で得たもの)。types に列挙しない type のチャンネルはそのチューナーで選局されないため
 
-    各チューナーのリストが空ならそのセクションは出力せず、全チューナーが空なら説明コメントのみを返す
+    detected_cards (カード在庫) が渡された場合は、CATV チューナーエントリに `decoder:` を出力し、
+    カード構成に応じた説明をヘッダーコメントに追記する (省略時 (None) の出力は従来と完全に同一)
     """
 
     def __init__(
@@ -897,6 +1049,7 @@ class CATVMirakurunTunersYmlFormatter:
         isdbs_tuners: list[ISDBTuner],
         dvbv5_conf_path: Path,
         catv_channel_types: list[str],
+        detected_cards: list[DetectedCard] | None = None,
     ) -> None:
         """
         Args:
@@ -906,6 +1059,8 @@ class CATVMirakurunTunersYmlFormatter:
             isdbs_tuners (list[ISDBTuner]): ネイティブ ISDB-S チューナーのリスト
             dvbv5_conf_path (Path): dvbv5-zap に渡す CATV 用 dvbv5 conf ファイルのパス
             catv_channel_types (list[str]): channels 側へ実際に出力された CATV エントリの type 集合 (GR/BS/CS/SKY)
+            detected_cards (list[DetectedCard] | None): 検出された CAS カードの一覧
+                (None = カード検出を行っていない。この場合は decoder もカード関連コメントも出力しない)
         """
 
         self._save_file_path = save_file_path
@@ -914,6 +1069,9 @@ class CATVMirakurunTunersYmlFormatter:
         self._isdbs_tuners = isdbs_tuners
         self._dvbv5_conf_path = dvbv5_conf_path
         self._catv_channel_types = catv_channel_types
+        self._detected_cards = detected_cards
+        # デコーダーラッパースクリプトは tuners.yml と同じディレクトリ (出力先の Mirakurun/) に生成される
+        self._script_dir = save_file_path.parent
 
     def format(self) -> str:
         """
@@ -934,17 +1092,34 @@ class CATVMirakurunTunersYmlFormatter:
             '# 管理する) を意図した値だが、dvbv5-zap の `-t` はロックタイムアウトと録画時間を兼ねる特殊仕様のため、',
             '# 実運用に組み込む際は実機で `-t 0` の挙動 (無制限に出力し続けるか) を確認してから使うこと',
         ]
+        # カード在庫が渡されている場合のみ、CAS カード関連の説明をヘッダーに追記する (未指定時は従来どおりの出力)
+        if self._detected_cards is not None:
+            header_lines.extend(_BuildMirakurunCardHeaderLines(self._detected_cards, self._script_dir))
+        decoder_command = (
+            _GetMirakurunDecoderCommand(self._detected_cards, self._script_dir) if self._detected_cards is not None else None
+        )
 
         tuners: list[CATVMirakurunTuner] = []
         for catv_tuner in self._catv_tuners:
-            tuners.append({
-                'name': f'{catv_tuner.name} (adapter{catv_tuner.adapter_number})',
-                'types': list(self._catv_channel_types),
-                'command': (
-                    f'dvbv5-zap -c {self._dvbv5_conf_path} -a {catv_tuner.adapter_number} -P -t 0 -o - <channel>'
-                ),
-                'isDisabled': False,
-            })
+            command = f'dvbv5-zap -c {self._dvbv5_conf_path} -a {catv_tuner.adapter_number} -P -t 0 -o - <channel>'
+            catv_entry: CATVMirakurunTuner
+            if decoder_command is not None:
+                # 既存 isdb_scanner/formatter.py の MirakurunTunersYmlFormatter に倣い、decoder は command の直後に置く
+                catv_entry = {
+                    'name': f'{catv_tuner.name} (adapter{catv_tuner.adapter_number})',
+                    'types': list(self._catv_channel_types),
+                    'command': command,
+                    'decoder': decoder_command,
+                    'isDisabled': False,
+                }
+            else:
+                catv_entry = {
+                    'name': f'{catv_tuner.name} (adapter{catv_tuner.adapter_number})',
+                    'types': list(self._catv_channel_types),
+                    'command': command,
+                    'isDisabled': False,
+                }
+            tuners.append(catv_entry)
         for isdbt_tuner in self._isdbt_tuners:
             tuners.append({
                 'name': isdbt_tuner.name,
@@ -984,6 +1159,9 @@ class CATVMirakcTunersYmlFormatter:
     パイプする必要がある (channels 側の extra-args に相対 TS 番号を出力している)。ここでは基本形の command のみを
     出力し、isdb-tsmf-split の組み込み方はヘッダーコメントの例として示すに留める
 
+    detected_cards (カード在庫) が渡された場合は、ヘッダーコメントにカード構成に応じた decode-filter の
+    組み込み例を追記する (省略時 (None) の出力は従来と完全に同一)
+
     各チューナーのリストが空ならそのセクションは出力せず、全チューナーが空なら説明コメントのみを返す
     """
 
@@ -995,6 +1173,7 @@ class CATVMirakcTunersYmlFormatter:
         isdbs_tuners: list[ISDBTuner],
         dvbv5_conf_path: Path,
         catv_channel_types: list[str],
+        detected_cards: list[DetectedCard] | None = None,
     ) -> None:
         """
         Args:
@@ -1004,6 +1183,8 @@ class CATVMirakcTunersYmlFormatter:
             isdbs_tuners (list[ISDBTuner]): ネイティブ ISDB-S チューナーのリスト
             dvbv5_conf_path (Path): dvbv5-zap に渡す CATV 用 dvbv5 conf ファイルのパス
             catv_channel_types (list[str]): channels 側へ実際に出力された CATV エントリの type 集合 (GR/BS/CS/SKY)
+            detected_cards (list[DetectedCard] | None): 検出された CAS カードの一覧
+                (None = カード検出を行っていない。この場合はカード関連コメントを出力しない)
         """
 
         self._save_file_path = save_file_path
@@ -1012,6 +1193,9 @@ class CATVMirakcTunersYmlFormatter:
         self._isdbs_tuners = isdbs_tuners
         self._dvbv5_conf_path = dvbv5_conf_path
         self._catv_channel_types = catv_channel_types
+        self._detected_cards = detected_cards
+        # decode-filter スクリプトは tuners 設定断片と同じディレクトリ (出力先の mirakc/) に生成される
+        self._script_dir = save_file_path.parent
 
     def format(self) -> str:
         """
@@ -1045,6 +1229,9 @@ class CATVMirakcTunersYmlFormatter:
             '# 管理する) を意図した値だが、dvbv5-zap の `-t` はロックタイムアウトと録画時間を兼ねる特殊仕様のため、',
             '# 実運用に組み込む際は実機で `-t 0` の挙動 (無制限に出力し続けるか) を確認してから使うこと',
         ]
+        # カード在庫が渡されている場合のみ、CAS カード関連の説明をヘッダーに追記する (未指定時は従来どおりの出力)
+        if self._detected_cards is not None:
+            header_lines.extend(_BuildMirakcCardHeaderLines(self._detected_cards, self._script_dir))
 
         tuners: list[CATVMirakcTuner] = []
         for catv_tuner in self._catv_tuners:
