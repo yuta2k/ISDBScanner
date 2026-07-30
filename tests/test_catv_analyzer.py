@@ -134,13 +134,15 @@ class TestDetermineRetransmissionSource:
         assert DetermineRetransmissionSource(0x0006) == 'CS'
         assert DetermineRetransmissionSource(0x0007) == 'CS'
 
-    def test_catv_self_broadcast_range_boundaries(self):
-        # 0x7C1F-0x7F5F は CATV 事業者の地デジ網内自主放送 (JCL SPEC-006/007)
-        # この範囲は地上波の範囲 (0x7880-0x7FE8) に内包されているため、地上波より優先して判定される必要がある
-        assert DetermineRetransmissionSource(0x7C1E) == 'Terrestrial'  # 範囲の直前は地上波再送信
-        assert DetermineRetransmissionSource(0x7C1F) == 'SelfBroadcast'  # 範囲の下限
-        assert DetermineRetransmissionSource(0x7F5F) == 'SelfBroadcast'  # 範囲の上限
-        assert DetermineRetransmissionSource(0x7F60) == 'Terrestrial'  # 範囲の直後は地上波再送信
+    def test_catv_self_broadcast_range_is_not_special_cased(self):
+        # 0x7C1F-0x7F5F は付録N 上は CATV 事業者の地デジ網内自主放送 (JCL SPEC-006/007) の範囲だが、
+        # 範囲内の具体的な割当は非公開規定に委ねられており、実データではこの範囲に地上波放送事業者 (独立局)
+        # 自身の network_id も含まれることを確認している。範囲判定を入れると地上波の区域外再送信を自主放送と
+        # 誤判定してしまうため、この範囲は特別扱いせず地上波再送信として扱う (回帰防止のためのテスト)
+        assert DetermineRetransmissionSource(0x7C1E) == 'Terrestrial'  # 範囲の直前
+        assert DetermineRetransmissionSource(0x7C1F) == 'Terrestrial'  # 範囲の下限
+        assert DetermineRetransmissionSource(0x7F5F) == 'Terrestrial'  # 範囲の上限
+        assert DetermineRetransmissionSource(0x7F60) == 'Terrestrial'  # 範囲の直後
 
     def test_terrestrial_range_boundaries(self):
         # 0x7880-0x7FE8 は地上デジタルテレビジョン放送の再送信

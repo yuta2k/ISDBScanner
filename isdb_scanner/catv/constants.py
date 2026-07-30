@@ -90,7 +90,11 @@ def GetCASystemName(ca_system_id: int) -> str:
 
 # network_id (ARIB STD-B10 付録N「ネットワーク識別の割当」) のうち、CATV 関連の割当
 # CATV 事業者の地デジ網内自主放送 (運用規定: JCL SPEC-006 (パススルー) / JCL SPEC-007 (トランスモジュレーション))
-# この範囲は地上波再送信の network_id 範囲 (0x7880-0x7FE8) に完全に内包されているため、地上波判定より先に判定する必要がある
+# この範囲は地上波再送信の network_id 範囲 (0x7880-0x7FE8) に完全に内包されている
+# ただし範囲内の具体的な割当は非公開の JCL SPEC-006 第2分冊 / JCL SPEC-007 第2部 に委ねられており (付録N 脚注*3)、
+# 実データではこの範囲に地上波放送事業者 (独立局) 自身の network_id も含まれることを確認している
+# このため範囲判定だけでは CATV 自主放送と地上波再送信を区別できず、再送信元の判定には使用していない
+# (CATVCarrierAnalyzer.__determineRetransmissionSource() の docstring も参照。参考情報としてのみ定義する)
 NETWORK_ID_CATV_SELF_BROADCAST_RANGE: tuple[int, int] = (0x7C1F, 0x7F5F)
 # デジアナ変換 (運用規定: JCL SPEC-008)
 NETWORK_ID_DIGITAL_ANALOG_CONVERSION: int = 0xFFFC
